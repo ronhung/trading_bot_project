@@ -15,6 +15,7 @@ class BinanceZmqClient:
         self.commander = self.context.socket(zmq.PUSH)
         
         self.kline_callback = None
+        self.order_update_callback = None
         self.is_running = False
 
     def connect(self):
@@ -32,6 +33,10 @@ class BinanceZmqClient:
 
     def set_kline_callback(self, callback):
         self.kline_callback = callback
+
+    def set_order_update_callback(self, callback):
+        """Callback for order status updates from C++ (FILLED, CANCELED, etc.)."""
+        self.order_update_callback = callback
 
     # [added] dedicated function to send order signals
     def send_order_signal(self, action: str, symbol: str, price: float, stop_price: float = 0.0):
@@ -56,10 +61,13 @@ class BinanceZmqClient:
             while self.is_running:
                 message = self.subscriber.recv_string()
                 data = json.loads(message)
-                if data.get("type") == "kline" and self.kline_callback:
+                mtype = data.get("type")
+                if mtype == "kline" and self.kline_callback:
                     self.kline_callback(data)
                     # ACK after strategy callback so any order is pushed first.
                     self._send_ack()
+                elif mtype == "order_update" and self.order_update_callback:
+                    self.order_update_callback(data)
         except KeyboardInterrupt:
             print("\n🛑 [ZMQ Client] Listening stopped.")
         finally:

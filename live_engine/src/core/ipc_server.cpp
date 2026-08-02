@@ -30,6 +30,14 @@ IpcServer::IpcServer(int pub_port, int pull_port,
     if (!sync_mode_) {
         rx_thread = std::thread(&IpcServer::receive_loop, this);
     }
+
+    // Wire the executor's order status callback to our thread-safe queue.
+    // (MockExecutor's default is a no-op, so backtest is unaffected.)
+    if (executor_) {
+        executor_->set_order_status_callback([this](const OrderStatusUpdate& u) {
+            queue_order_update(u);
+        });
+    }
 }
 
 IpcServer::~IpcServer() {
@@ -56,9 +64,42 @@ void IpcServer::publish_kline(const KLineData& kline) {
     j["trades_count"] = kline.trades_count;
     j["is_closed"] = kline.is_closed;
 
+    // Inject real RiskManager state so Python brain knows actual position
+    j["current_position"]  = risk_manager_ ? risk_manager_->get_current_position() : 0.0;
+    j["available_balance"] = risk_manager_ ? risk_manager_->get_current_balance()   : 0.0;
+    j["stop_price"]        = risk_manager_ ? risk_manager_->get_stop_price()        : 0.0;
+
     std::string message = j.dump();
     zmq::message_t zmq_msg(message.begin(), message.end());
     publisher.send(zmq_msg, zmq::send_flags::none);
+}
+
+// ---------------------------------------------------------------------------
+// Thread-safe order update queue → PUB socket
+// Called from any thread; actual PUB send only from main-loop via pump.
+// ---------------------------------------------------------------------------
+void IpcServer::queue_order_update(const OrderStatusUpdate& u) {
+    json j;
+    j["type"] = "order_update";
+    j["symbol"] = u.symbol;
+    j["client_order_id"] = u.client_order_id;
+    j["order_id"] = u.order_id;
+    j["side"] = u.side;
+    j["order_type"] = u.order_type;
+    j["quantity"] = u.quantity;
+    j["price"] = u.price;
+    j["status"] = u.status;
+    j["reduce_only"] = u.reduce_only;
+    j["reason"] = u.reason;
+    order_update_queue_.push(j.dump());
+}
+
+void IpcServer::pump_order_updates() {
+    std::string msg;
+    while (order_update_queue_.try_pop(msg)) {
+        zmq::message_t zmq_msg(msg.begin(), msg.end());
+        publisher.send(zmq_msg, zmq::send_flags::none);
+    }
 }
 
 bool IpcServer::recv_until_ack(int timeout_ms) {
@@ -147,13 +188,23 @@ void IpcServer::handle_message(const std::string& msg_str) {
             return;
         }
 
+        // Also refuse if there's already a pending open order
+        if (executor_->has_open_order()) {
+            std::cout << "🚫 [IPC] Open order already pending; ignore duplicate open." << std::endl;
+            return;
+        }
+
         double safe_quantity = risk_manager_->calculate_target_size(action, price, stop_price);
         if (safe_quantity <= 0.0) {
             std::cout << "🚫 [IPC] Insufficient balance or invalid stop, cancel open position." << std::endl;
             return;
         }
-        executor_->send_order(symbol, action, safe_quantity, price, false);
-        risk_manager_->set_stop_price(stop_price);
+        bool ok = executor_->send_order(symbol, action, safe_quantity, price, false);
+        if (ok) {
+            risk_manager_->set_stop_price(stop_price);
+        } else {
+            std::cout << "❌ [IPC] Order rejected by executor (not tracked)." << std::endl;
+        }
     } else if (action == "CLOSE_LONG" || action == "CLOSE_SHORT") {
         double current_pos = risk_manager_->get_current_position();
         double close_quantity = std::abs(current_pos);

@@ -71,6 +71,9 @@ int main() {
         std::cout << "👑 Quantitative live engine starting..." << std::endl;
         IpcServer ipc(pub_port, pull_port, &executor, &risk_manager, false);
 
+        // Start the order monitor thread (timeout → cancel → reprice)
+        executor.start_order_monitor();
+
         std::string listen_key = executor.get_listen_key();
         ix::WebSocket user_ws;
 
@@ -78,11 +81,22 @@ int main() {
             std::string user_ws_url = "wss://stream.binancefuture.com/ws/" + listen_key;
             user_ws.setUrl(user_ws_url);
 
-            user_ws.setOnMessageCallback([&risk_manager](const ix::WebSocketMessagePtr& msg) {
+            user_ws.setOnMessageCallback([&risk_manager, &executor](const ix::WebSocketMessagePtr& msg) {
                 if (msg->type == ix::WebSocketMessageType::Message) {
                     try {
                         json j = json::parse(msg->str);
-                        if (j.contains("e") && j["e"] == "ACCOUNT_UPDATE") {
+                        if (j.contains("e") && j["e"] == "ORDER_TRADE_UPDATE") {
+                            // Handle order status updates (fills, cancels, etc.)
+                            if (j.contains("o")) {
+                                auto& o = j["o"];
+                                std::string client_id = o.value("c", "");
+                                std::string status = o.value("X", "");  // NEW, PARTIALLY_FILLED, FILLED, CANCELED...
+                                double filled_qty = std::stod(o.value("z", "0"));
+                                if (!client_id.empty()) {
+                                    executor.on_order_update(client_id, status, filled_qty);
+                                }
+                            }
+                        } else if (j.contains("e") && j["e"] == "ACCOUNT_UPDATE") {
                             auto& account = j["a"];
                             if (account.contains("B")) {
                                 for (auto& balance : account["B"]) {
@@ -128,13 +142,18 @@ int main() {
         std::cout << "⚙️ Engine main loop is ready, waiting for market data..." << std::endl;
 
         while (true) {
-            market_queue.wait_and_pop(current_kline);
-            if (!current_kline.is_closed) {
-                continue;
+            // Flush any queued order status updates to Python (PUB socket, main thread only)
+            ipc.pump_order_updates();
+
+            // Wait for the next closed kline with a 250ms timeout so we can pump updates
+            if (market_queue.wait_and_pop(current_kline, 250)) {
+                if (!current_kline.is_closed) {
+                    continue;
+                }
+                std::cout << "[Main] Closed kline close=" << current_kline.close
+                          << " -> Python brain" << std::endl;
+                ipc.publish_kline(current_kline);
             }
-            std::cout << "[Main] Closed kline close=" << current_kline.close
-                      << " -> Python brain" << std::endl;
-            ipc.publish_kline(current_kline);
         }
 
         ix::uninitNetSystem();

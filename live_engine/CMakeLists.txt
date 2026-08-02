@@ -88,6 +88,7 @@ add_executable(live_engine
     src/live/main_live.cpp
     src/live/binance_ws.cpp
     src/live/binance_live_executor.cpp
+    src/live/order_tracker.cpp
 )
 
 target_include_directories(live_engine PRIVATE

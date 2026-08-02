@@ -25,7 +25,7 @@ public:
                           double fee_rate = 0.0005,
                           double slippage_bps = 1.0);
 
-    void send_order(const std::string& symbol,
+    bool send_order(const std::string& symbol,
                     const std::string& side,
                     double quantity,
                     double price,

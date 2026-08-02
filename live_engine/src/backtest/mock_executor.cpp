@@ -39,13 +39,13 @@ void MockExecutor::record_trade(const std::string& symbol, const std::string& si
     trades_.push_back(rec);
 }
 
-void MockExecutor::send_order(const std::string& symbol,
+bool MockExecutor::send_order(const std::string& symbol,
                               const std::string& side,
                               double quantity,
                               double price,
                               bool reduce_only) {
     if (!risk_ || quantity <= 0.0 || price <= 0.0) {
-        return;
+        return false;
     }
 
     double fill_price = apply_slippage(side, price);
@@ -62,7 +62,7 @@ void MockExecutor::send_order(const std::string& symbol,
         double close_qty = std::min(quantity, std::abs(pos));
         if (close_qty <= 0.0) {
             std::cout << "⚪ [MockExecutor] Nothing to close." << std::endl;
-            return;
+            return false;
         }
         notional = fill_price * close_qty;
         fee = notional * fee_rate_;
@@ -90,7 +90,7 @@ void MockExecutor::send_order(const std::string& symbol,
         std::cout << "✅ [MockExecutor] CLOSE " << side << " qty=" << close_qty
                   << " @ " << fill_price << " | pnl=" << pnl << " fee=" << fee
                   << " | bal=" << bal << std::endl;
-        return;
+        return true;
     }
 
     // Opening / adding in direction of side
@@ -98,7 +98,7 @@ void MockExecutor::send_order(const std::string& symbol,
         // If currently short, this would flip — for simplicity require flat or same dir
         if (pos < 0.0) {
             std::cout << "⚠️ [MockExecutor] Already short; ignore BUY open (use CLOSE_SHORT)." << std::endl;
-            return;
+            return false;
         }
         double new_pos = pos + quantity;
         double new_entry = (pos <= 0.0)
@@ -111,10 +111,11 @@ void MockExecutor::send_order(const std::string& symbol,
         record_trade(symbol, side, quantity, fill_price, fee, 0.0, "open");
         std::cout << "✅ [MockExecutor] OPEN LONG qty=" << quantity << " @ " << fill_price
                   << " fee=" << fee << " | bal=" << bal << std::endl;
+        return true;
     } else if (side == "SELL") {
         if (pos > 0.0) {
             std::cout << "⚠️ [MockExecutor] Already long; ignore SELL open (use CLOSE_LONG)." << std::endl;
-            return;
+            return false;
         }
         double abs_pos = std::abs(pos);
         double new_abs = abs_pos + quantity;
@@ -128,7 +129,9 @@ void MockExecutor::send_order(const std::string& symbol,
         record_trade(symbol, side, quantity, fill_price, fee, 0.0, "open");
         std::cout << "✅ [MockExecutor] OPEN SHORT qty=" << quantity << " @ " << fill_price
                   << " fee=" << fee << " | bal=" << bal << std::endl;
+        return true;
     }
+    return false; // unknown side
 }
 
 bool MockExecutor::check_and_execute_stop(const std::string& symbol) {
