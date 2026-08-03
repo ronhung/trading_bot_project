@@ -31,6 +31,9 @@ public:
     // User data stream listen key
     std::string get_listen_key();
 
+    // Query the current exchange position for a symbol.
+    bool get_current_position(const std::string& symbol, double& out_position) override;
+
     // Cancel an order by clientOrderId
     bool cancel_order(const std::string& symbol, const std::string& client_order_id);
 

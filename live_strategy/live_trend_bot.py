@@ -1,6 +1,7 @@
 import os
 import sys
 import pandas as pd
+import requests
 from collections import deque
 from datetime import datetime
 
@@ -16,8 +17,48 @@ from zmq_client import BinanceZmqClient
 from shared.core_logic.turtle_math import calculate_turtle_signals 
 
 class LiveTurtleBot:
-    def __init__(self, symbol="BTCUSDT"):
+    # Field names matching C++ KLineData struct in live_engine/src/core/kline_data.h.
+    # Every bar stored in kline_buffer uses exactly this set of keys.
+    KLINE_FIELDS = [
+        "symbol", "open_time", "close_time",
+        "open", "high", "low", "close",
+        "volume", "quote_volume",
+        "taker_buy_base", "taker_buy_quote",
+        "trades_count", "is_closed",
+    ]
+
+    @staticmethod
+    def _kline_from_zmq(data: dict) -> dict:
+        """Extract KLineData fields from a C++ ZMQ kline message."""
+        return {k: data[k] for k in LiveTurtleBot.KLINE_FIELDS if k in data}
+
+    @staticmethod
+    def _kline_from_rest(k: list, symbol: str) -> dict:
+        """Build a KLineData dict from a Binance REST /fapi/v1/klines row.
+        Array indices: [0:open_time, 1:open, 2:high, 3:low, 4:close,
+        5:volume, 6:close_time, 7:quote_volume, 8:trades_count,
+        9:taker_buy_base, 10:taker_buy_quote, 11:ignore]
+        REST only returns closed bars, so is_closed is always True.
+        """
+        return {
+            "symbol": symbol,
+            "open_time": k[0],
+            "close_time": k[6],
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5]),
+            "quote_volume": float(k[7]),
+            "taker_buy_base": float(k[9]),
+            "taker_buy_quote": float(k[10]),
+            "trades_count": k[8],
+            "is_closed": True,
+        }
+
+    def __init__(self, symbol="BTCUSDT", warmup=True):
         self.symbol = symbol
+        self._do_warmup = warmup
         
         # live trading parameters (recommended: align these values with your best Backtrader results)
         self.entry_period = 2
@@ -48,14 +89,10 @@ class LiveTurtleBot:
         self.current_stop = data.get("stop_price", 0.0)
 
         if data.get("is_closed") == True:
-            # ensure the high, low, close fields required by the brain are extracted
-            cleaned_kline = {
-                "close_time": data["close_time"],
-                "high": data["high"],
-                "low": data["low"],
-                "close": data["close"]
-            }
-            self.kline_buffer.append(cleaned_kline)
+            # Store the full KLineData struct (all 13 fields) so any future
+            # strategy can access every field C++ sends.
+            kline = self._kline_from_zmq(data)
+            self.kline_buffer.append(kline)
             self.execute_strategy_logic()
 
     def on_order_update(self, data):
@@ -70,6 +107,56 @@ class LiveTurtleBot:
         extra = f" reason={reason}" if reason else ""
         ro = " [reduceOnly]" if reduce_only else ""
         print(f"📋 [Order] {cid}: {status} {side} qty={qty} @ {px}{ro}{extra}")
+
+    def warmup_buffer(self):
+        """
+        Fetch historical 1m klines from Binance REST API to pre-fill the
+        Donchian channel buffer.  Eliminates the cold-start waiting period.
+
+        Strategy window = max(entry_period, atr_period) + 1 bars.
+        We fetch a few extra bars to absorb any timing gap between the
+        REST snapshot and the first ZMQ bar from C++.
+        """
+        window_size = max(self.entry_period, self.atr_period) + 1
+        fetch_limit = window_size + 5
+
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        params = {
+            "symbol": self.symbol,
+            "interval": "1m",
+            "limit": fetch_limit
+        }
+
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            raw_klines = resp.json()
+        except Exception as e:
+            print(f"⚠️  [Warmup] REST fetch failed: {e}")
+            print("    Starting cold — waiting for real-time bars to fill buffer...")
+            return
+
+        if not raw_klines:
+            print("⚠️  [Warmup] REST returned empty klines array")
+            return
+
+        # Binance includes the still-forming (in-progress) candle as the last
+        # element. Drop it so we only buffer fully-closed bars — using the
+        # partial bar would inject a duplicate/revised row into the strategy
+        # buffer and skew the Donchian/ATR channels.
+        closed_klines = raw_klines[:-1] if len(raw_klines) > 1 else raw_klines
+        for k in closed_klines:
+            self.kline_buffer.append(self._kline_from_rest(k, self.symbol))
+
+        last_ct = self.kline_buffer[-1]["close_time"]
+        last_dt = datetime.fromtimestamp(last_ct / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"🔥 [Warmup] Fetched {len(closed_klines)} closed bars "
+              f"({len(raw_klines) - len(closed_klines)} forming bar skipped), "
+              f"{len(self.kline_buffer)} kept in buffer (maxlen={self.kline_buffer.maxlen}), "
+              f"last closed @ {last_dt}")
+
+        # If the buffer is already full after warmup, the next real-time bar
+        # will immediately trigger execute_strategy_logic().
 
     def execute_strategy_logic(self):
         # if there's not enough history to calculate the channels, wait
@@ -135,9 +222,19 @@ class LiveTurtleBot:
             print(f"[{dt_str}] ⚪ Standing by... (close: {price:.2f} | pos={self.current_position:.4f} | bal={self.available_balance:.2f})")
 
     def start(self):
+        if self._do_warmup:
+            # Pre-fill the Donchian buffer so we can trade immediately.
+            # Skip in backtest mode (--no-warmup) to avoid mixing live
+            # REST bars with historical CSV replay data.
+            self.warmup_buffer()
         self.client.connect()
         self.client.start_listening()
 
 if __name__ == "__main__":
-    bot = LiveTurtleBot()
+    import argparse
+    parser = argparse.ArgumentParser(description="Live Turtle Trading Bot")
+    parser.add_argument("--no-warmup", action="store_true",
+                        help="Skip REST warmup (use in C++ backtest mode)")
+    args = parser.parse_args()
+    bot = LiveTurtleBot(warmup=not args.no_warmup)
     bot.start()

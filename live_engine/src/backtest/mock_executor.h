@@ -32,6 +32,7 @@ public:
                     bool reduce_only = false) override;
 
     void set_market(const KLineData& bar);
+    bool get_current_position(const std::string& symbol, double& out_position) override;
     // Returns true if a stop was triggered and a close was filled.
     bool check_and_execute_stop(const std::string& symbol);
 

@@ -54,8 +54,17 @@ int main() {
         int pub_port = config.value("/zmq/market_feed_port"_json_pointer, 5555);
         int pull_port = config.value("/zmq/signal_port"_json_pointer, 5556);
 
-        BinanceLiveExecutor executor(API_KEY, SECRET_KEY);
         RiskManager risk_manager(0.02);
+
+        // IpcServer must be constructed BEFORE BinanceLiveExecutor so it is
+        // destroyed AFTER the executor.  This guarantees the order-monitor
+        // thread is joined (via ~BinanceLiveExecutor) before the ZMQ sockets
+        // and callback lambdas are torn down (via ~IpcServer).
+        IpcServer ipc(pub_port, pull_port, nullptr, &risk_manager, false);
+
+        BinanceLiveExecutor executor(API_KEY, SECRET_KEY);
+        ipc.set_executor(&executor);  // wire the callback after executor exists
+
         double init_balance = 0.0;
         double init_position = 0.0;
 
@@ -69,7 +78,6 @@ int main() {
         }
 
         std::cout << "👑 Quantitative live engine starting..." << std::endl;
-        IpcServer ipc(pub_port, pull_port, &executor, &risk_manager, false);
 
         // Start the order monitor thread (timeout → cancel → reprice)
         executor.start_order_monitor();
@@ -95,6 +103,11 @@ int main() {
                                 if (!client_id.empty()) {
                                     executor.on_order_update(client_id, status, filled_qty);
                                 }
+                                // NOTE: RiskManager position/balance are intentionally
+                                // NOT updated from ORDER_TRADE_UPDATE — it carries no
+                                // position amount, and deriving one via fill deltas races
+                                // with ACCOUNT_UPDATE. The ACCOUNT_UPDATE handler below is
+                                // the single authoritative source of position/balance.
                             }
                         } else if (j.contains("e") && j["e"] == "ACCOUNT_UPDATE") {
                             auto& account = j["a"];

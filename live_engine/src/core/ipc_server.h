@@ -32,6 +32,11 @@ public:
     // MUST be called only from the main-loop thread (ZMQ socket not thread-safe).
     void pump_order_updates();
 
+    // Post-construction wiring: set executor and hook its status callback.
+    // Used when IpcServer must be constructed before the executor to guarantee
+    // safe destruction order (monitor thread must be joined before ~IpcServer).
+    void set_executor(IOrderExecutor* executor);
+
 private:
     void receive_loop();
     void handle_message(const std::string& msg_str);

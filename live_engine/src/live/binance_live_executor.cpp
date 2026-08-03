@@ -80,13 +80,21 @@ bool BinanceLiveExecutor::place_order_internal(const std::string& symbol,
 
     std::string cid = next_client_order_id();
 
+    // Round to Binance tick/step sizes (BTCUSDT: price=0.01, qty=0.001)
+    double rounded_price = std::round(price * 100.0) / 100.0;
+    double rounded_qty   = std::floor(quantity * 1000.0) / 1000.0;
+    if (rounded_qty <= 0.0) {
+        std::cerr << "⚠️ [BinanceLiveExecutor] Rounded quantity is zero; rejecting order." << std::endl;
+        return false;
+    }
+
     std::stringstream query_ss;
     query_ss << "symbol=" << symbol
              << "&side=" << side
              << "&type=LIMIT"
              << "&timeInForce=GTC"
-             << "&quantity=" << quantity
-             << "&price=" << price
+             << "&quantity=" << rounded_qty
+             << "&price=" << rounded_price
              << "&newClientOrderId=" << cid
              << "&timestamp=" << ms;
 
@@ -105,7 +113,7 @@ bool BinanceLiveExecutor::place_order_internal(const std::string& symbol,
     cli.set_connection_timeout(5);
 
     std::cout << "\n🔫 [BinanceLiveExecutor] Sending " << side << " " << symbol
-              << " @ " << price << " (qty: " << quantity
+              << " @ " << rounded_price << " (qty: " << rounded_qty
               << ", cid: " << cid
               << (reduce_only ? ", reduceOnly" : "")
               << (reprice_attempts > 0 ? ", reprice#" + std::to_string(reprice_attempts) : "")
@@ -118,20 +126,35 @@ bool BinanceLiveExecutor::place_order_internal(const std::string& symbol,
             json j = json::parse(res->body);
             int64_t order_id = j.value("orderId", 0LL);
             std::string status = j.value("status", "NEW");
+            double executed_qty = std::stod(j.value("executedQty", "0"));
 
             TrackedOrder tracked;
+            tracked.order_id = order_id;
             tracked.client_order_id = cid;
             tracked.symbol = symbol;
             tracked.side = side;
-            tracked.quantity = quantity;
-            tracked.price = price;
+            tracked.quantity = rounded_qty;
+            tracked.filled_quantity = executed_qty;
+            tracked.price = rounded_price;
             tracked.reduce_only = reduce_only;
             tracked.reprice_attempts = reprice_attempts;
             tracked.created_at = std::chrono::steady_clock::now();
             if (status == "NEW") tracked.status = TrackedOrderStatus::NEW;
+            else if (status == "PARTIALLY_FILLED") tracked.status = TrackedOrderStatus::PARTIALLY_FILLED;
             else if (status == "FILLED") tracked.status = TrackedOrderStatus::FILLED;
+            else if (status == "CANCELED") tracked.status = TrackedOrderStatus::CANCELED;
+            else if (status == "EXPIRED") tracked.status = TrackedOrderStatus::EXPIRED;
+            else if (status == "REJECTED") tracked.status = TrackedOrderStatus::REJECTED;
 
             order_tracker_.register_order(tracked);
+
+            // If the exchange already reached a terminal state in the POST
+            // response (e.g. an instant fill), publish it immediately so Python
+            // learns even if the private-WS event is delayed or the stream drops.
+            if (status == "FILLED" || status == "CANCELED" ||
+                status == "EXPIRED" || status == "REJECTED") {
+                order_tracker_.on_order_update(cid, status, executed_qty);
+            }
 
             std::cout << "✅ [BinanceLiveExecutor] Order accepted! orderId=" << order_id
                       << " cid=" << cid << " status=" << status << std::endl;
@@ -189,10 +212,13 @@ bool BinanceLiveExecutor::cancel_order(const std::string& symbol, const std::str
     if (res && res->status == 200) {
         try {
             json j = json::parse(res->body);
-            std::string status = j.value("status", "CANCELED");
-            std::cout << "✅ [BinanceLiveExecutor] Cancel accepted: " << client_order_id
+            std::string status = j.value("status", "");
+            std::cout << "✅ [BinanceLiveExecutor] Cancel response: " << client_order_id
                       << " -> " << status << std::endl;
-            return true;
+            // Only return true if the order was genuinely canceled.
+            // If the order already filled/expired, return false so the
+            // monitor loop does NOT reprice (would create a duplicate).
+            return (status == "CANCELED");
         } catch (const std::exception& e) {
             std::cerr << "🔥 Failed to parse cancel response: " << e.what() << std::endl;
             return false;
@@ -307,21 +333,29 @@ void BinanceLiveExecutor::monitor_loop() {
                           << " timed out with " << ord.reprice_attempts
                           << " reprice attempts — canceling (exhausted)." << std::endl;
 
-                cancel_order(ord.symbol, ord.client_order_id);
-                order_tracker_.mark_cancel_requested(ord.client_order_id);
+                bool was_canceled = cancel_order(ord.symbol, ord.client_order_id);
 
-                // Publish exhausted status
-                OrderStatusUpdate u;
-                u.client_order_id = ord.client_order_id;
-                u.symbol = ord.symbol;
-                u.side = ord.side;
-                u.order_type = "LIMIT";
-                u.quantity = ord.quantity;
-                u.price = ord.price;
-                u.status = "CANCELED";
-                u.reduce_only = ord.reduce_only;
-                u.reason = "timeout_exhausted";
-                publish_status(u);
+                if (was_canceled) {
+                    // Only mark terminal when the cancel genuinely succeeded.
+                    // Otherwise leave the order live — the WS will resolve it.
+                    order_tracker_.mark_cancel_requested(ord.client_order_id);
+
+                    OrderStatusUpdate u;
+                    u.client_order_id = ord.client_order_id;
+                    u.symbol = ord.symbol;
+                    u.side = ord.side;
+                    u.order_type = "LIMIT";
+                    u.quantity = ord.quantity;
+                    u.price = ord.price;
+                    u.status = "CANCELED";
+                    u.reduce_only = ord.reduce_only;
+                    u.reason = "timeout_exhausted";
+                    publish_status(u);
+                } else {
+                    std::cout << "⚠️ [OrderMonitor] Exhausted cancel failed for "
+                              << ord.client_order_id
+                              << " — awaiting WS event." << std::endl;
+                }
 
             } else {
                 // Cancel and reprice
@@ -329,28 +363,29 @@ void BinanceLiveExecutor::monitor_loop() {
                           << " timed out (" << ord.reprice_attempts
                           << " prev reprice(s)) — cancel + reprice." << std::endl;
 
-                bool canceled = cancel_order(ord.symbol, ord.client_order_id);
+                bool was_canceled = cancel_order(ord.symbol, ord.client_order_id);
 
-                // Mark the old order as cancelled in tracker
-                order_tracker_.mark_cancel_requested(ord.client_order_id);
+                if (was_canceled) {
+                    // Cancel succeeded — mark terminal, publish, reprice
+                    order_tracker_.mark_cancel_requested(ord.client_order_id);
 
-                // Publish cancel status
-                OrderStatusUpdate cu;
-                cu.client_order_id = ord.client_order_id;
-                cu.symbol = ord.symbol;
-                cu.side = ord.side;
-                cu.order_type = "LIMIT";
-                cu.quantity = ord.quantity;
-                cu.price = ord.price;
-                cu.status = "CANCELED";
-                cu.reduce_only = ord.reduce_only;
-                cu.reason = "timeout";
-                publish_status(cu);
+                    OrderStatusUpdate cu;
+                    cu.client_order_id = ord.client_order_id;
+                    cu.symbol = ord.symbol;
+                    cu.side = ord.side;
+                    cu.order_type = "LIMIT";
+                    cu.quantity = ord.quantity;
+                    cu.price = ord.price;
+                    cu.status = "CANCELED";
+                    cu.reduce_only = ord.reduce_only;
+                    cu.reason = "timeout";
+                    publish_status(cu);
 
-                if (canceled) {
-                    // Reprice at current market
                     reprice_order(ord);
                 } else {
+                    // Cancel failed — order may have filled or network error.
+                    // Leave the order in the tracker; WS ORDER_TRADE_UPDATE
+                    // will resolve it.  Do NOT reprice (would double-fill).
                     std::cout << "⚠️ [OrderMonitor] Cancel failed for " << ord.client_order_id
                               << " — awaiting WS event; will not reprice." << std::endl;
                 }
@@ -362,6 +397,44 @@ void BinanceLiveExecutor::monitor_loop() {
 // ---------------------------------------------------------------------------
 // Utility: listen key + initial state (unchanged logic)
 // ---------------------------------------------------------------------------
+bool BinanceLiveExecutor::get_current_position(const std::string& symbol, double& out_position) {
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+
+    std::string query_string = "timestamp=" + std::to_string(ms);
+    std::string signature = generate_signature(query_string);
+    std::string path = "/fapi/v2/account?" + query_string + "&signature=" + signature;
+
+    httplib::Headers headers = {
+        {"X-MBX-APIKEY", api_key_}
+    };
+
+    httplib::Client cli("https://testnet.binancefuture.com");
+    cli.set_connection_timeout(5);
+
+    auto res = cli.Get(path.c_str(), headers);
+    if (res && res->status == 200) {
+        try {
+            json j = json::parse(res->body);
+            out_position = 0.0;
+            for (auto& pos : j["positions"]) {
+                if (pos["symbol"].get<std::string>() == symbol) {
+                    out_position = std::stod(pos["positionAmt"].get<std::string>());
+                    return true;
+                }
+            }
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "🔥 Failed to parse exchange position: " << e.what() << std::endl;
+            return false;
+        }
+    }
+
+    std::cerr << "❌ Failed to query exchange position! Status: "
+              << (res ? std::to_string(res->status) : "connection error") << std::endl;
+    return false;
+}
+
 std::string BinanceLiveExecutor::get_listen_key() {
     httplib::Client cli("https://testnet.binancefuture.com");
     cli.set_connection_timeout(5);

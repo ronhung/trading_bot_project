@@ -18,41 +18,45 @@ void OrderTracker::register_order(const TrackedOrder& order) {
 void OrderTracker::on_order_update(const std::string& client_order_id,
                                     const std::string& status,
                                     double filled_qty) {
-    TrackedOrder* ord = nullptr;
+    TrackedOrder ord_copy;
     bool is_terminal = false;
     bool should_fire = false;
+    bool found = false;
 
     {
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = orders_.find(client_order_id);
         if (it != orders_.end()) {
-            ord = &it->second;
+            found = true;
 
             // Map Binance status string to our enum
-            if (status == "NEW") ord->status = TrackedOrderStatus::NEW;
-            else if (status == "PARTIALLY_FILLED") ord->status = TrackedOrderStatus::PARTIALLY_FILLED;
-            else if (status == "FILLED") ord->status = TrackedOrderStatus::FILLED;
-            else if (status == "CANCELED") ord->status = TrackedOrderStatus::CANCELED;
-            else if (status == "EXPIRED") ord->status = TrackedOrderStatus::EXPIRED;
-            else if (status == "REJECTED") ord->status = TrackedOrderStatus::REJECTED;
+            if (status == "NEW") it->second.status = TrackedOrderStatus::NEW;
+            else if (status == "PARTIALLY_FILLED") it->second.status = TrackedOrderStatus::PARTIALLY_FILLED;
+            else if (status == "FILLED") it->second.status = TrackedOrderStatus::FILLED;
+            else if (status == "CANCELED") it->second.status = TrackedOrderStatus::CANCELED;
+            else if (status == "EXPIRED") it->second.status = TrackedOrderStatus::EXPIRED;
+            else if (status == "REJECTED") it->second.status = TrackedOrderStatus::REJECTED;
 
-            ord->filled_quantity = filled_qty;
+            it->second.filled_quantity = filled_qty;
 
             is_terminal = (status == "FILLED" || status == "CANCELED" ||
                           status == "EXPIRED" || status == "REJECTED");
 
-            if (is_terminal && !ord->reported_terminal) {
-                ord->reported_terminal = true;
+            if (is_terminal && !it->second.reported_terminal) {
+                it->second.reported_terminal = true;
                 should_fire = true;
             }
+
+            // Copy under lock — pointer would dangle after unlock (prune can erase)
+            ord_copy = it->second;
         }
     }
 
-    if (should_fire && ord) {
-        fire_update(*ord);
+    if (should_fire) {
+        fire_update(ord_copy);
     }
 
-    if (ord) {
+    if (found) {
         std::cout << "📋 [OrderTracker] " << client_order_id
                   << " -> " << status
                   << (is_terminal ? " (terminal)" : "")
@@ -80,22 +84,15 @@ std::vector<TrackedOrder> OrderTracker::get_timed_out_orders(int timeout_ms) {
 }
 
 void OrderTracker::mark_cancel_requested(const std::string& client_order_id) {
-    TrackedOrder ord_copy;
-    bool should_fire = false;
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        auto it = orders_.find(client_order_id);
-        if (it != orders_.end()) {
-            it->second.status = TrackedOrderStatus::CANCELED;
-            if (!it->second.reported_terminal) {
-                it->second.reported_terminal = true;
-                ord_copy = it->second;
-                should_fire = true;
-            }
-        }
-    }
-    if (should_fire) {
-        fire_update(ord_copy);
+    // Mark the order terminal WITHOUT publishing. The caller (order monitor)
+    // publishes exactly one CANCELED update with the correct reason, and this
+    // flag de-dupes the subsequent WebSocket CANCELED event. Publishing here as
+    // well would send two conflicting updates for the same order.
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto it = orders_.find(client_order_id);
+    if (it != orders_.end()) {
+        it->second.status = TrackedOrderStatus::CANCELED;
+        it->second.reported_terminal = true;
     }
 }
 
@@ -109,13 +106,6 @@ bool OrderTracker::has_open_order() const {
         }
     }
     return false;
-}
-
-const TrackedOrder* OrderTracker::find(const std::string& client_order_id) const {
-    std::lock_guard<std::mutex> lock(mtx_);
-    auto it = orders_.find(client_order_id);
-    if (it != orders_.end()) return &it->second;
-    return nullptr;
 }
 
 void OrderTracker::prune(int age_ms) {
@@ -136,6 +126,7 @@ void OrderTracker::prune(int age_ms) {
 
 void OrderTracker::fire_update(const TrackedOrder& order) {
     OrderStatusUpdate u;
+    u.order_id = order.order_id;
     u.client_order_id = order.client_order_id;
     u.symbol = order.symbol;
     u.side = order.side;

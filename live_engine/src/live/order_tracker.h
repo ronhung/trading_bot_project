@@ -11,12 +11,12 @@ enum class TrackedOrderStatus { NEW, PARTIALLY_FILLED, FILLED, CANCELED, EXPIRED
 
 struct TrackedOrder {
     std::string client_order_id;
+    int64_t order_id = 0;          // server-assigned id from REST response (audit)
     std::string symbol;
-    std::string side;           // "BUY" or "SELL"
+    std::string side;              // "BUY" or "SELL"
     double quantity = 0.0;
     double filled_quantity = 0.0;  // cumulative filled qty from WS (o.z)
     double price = 0.0;
-    double stop_price = 0.0;    // associated stop (for reprice context)
     bool reduce_only = false;
     TrackedOrderStatus status = TrackedOrderStatus::NEW;
     int reprice_attempts = 0;
@@ -42,15 +42,13 @@ public:
     // Returns orders that have been in NEW or PARTIALLY_FILLED state for > timeout_ms.
     std::vector<TrackedOrder> get_timed_out_orders(int timeout_ms);
 
-    // Mark an order as having had a cancel request sent.
-    // If the WS later reports it as filled, we won't reprice.
+    // Mark an order as cancelled after the watchdog's cancel succeeded.
+    // Marks terminal only (does NOT publish) — the caller publishes the single
+    // CANCELED update; this flag de-dupes the subsequent WS CANCELED event.
     void mark_cancel_requested(const std::string& client_order_id);
 
     // Check if any order is currently open (NEW or PARTIALLY_FILLED).
     bool has_open_order() const;
-
-    // Look up an order by client_order_id.
-    const TrackedOrder* find(const std::string& client_order_id) const;
 
     // Prune orders that are terminal and older than age_ms.
     void prune(int age_ms = 600000);  // default 10 minutes

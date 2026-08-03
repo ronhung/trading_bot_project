@@ -40,6 +40,15 @@ IpcServer::IpcServer(int pub_port, int pull_port,
     }
 }
 
+void IpcServer::set_executor(IOrderExecutor* executor) {
+    executor_ = executor;
+    if (executor_) {
+        executor_->set_order_status_callback([this](const OrderStatusUpdate& u) {
+            queue_order_update(u);
+        });
+    }
+}
+
 IpcServer::~IpcServer() {
     running = false;
     if (rx_thread.joinable()) {
@@ -206,22 +215,43 @@ void IpcServer::handle_message(const std::string& msg_str) {
             std::cout << "❌ [IPC] Order rejected by executor (not tracked)." << std::endl;
         }
     } else if (action == "CLOSE_LONG" || action == "CLOSE_SHORT") {
-        double current_pos = risk_manager_->get_current_position();
-        double close_quantity = std::abs(current_pos);
-        if (close_quantity <= 0.0) {
-            std::cout << "⚪ [IPC] No current position; ignoring close command." << std::endl;
-            return;
-        }
-        if (action == "CLOSE_LONG") {
-            std::cout << "🛡️ [Close Long] Current position: " << current_pos
-                      << ", sending SELL + reduceOnly" << std::endl;
-            executor_->send_order(symbol, "SELL", close_quantity, price, true);
+        double verified_pos = 0.0;
+        if (executor_->get_current_position(symbol, verified_pos)) {
+            std::cout << "🧭 [IPC] Verified exchange position for " << symbol
+                      << ": " << verified_pos << std::endl;
         } else {
-            std::cout << "🛡️ [Close Short] Current position: " << current_pos
-                      << ", sending BUY + reduceOnly" << std::endl;
-            executor_->send_order(symbol, "BUY", close_quantity, price, true);
+            // REST verify unavailable (transient network blip) — fall back to the
+            // RiskManager position, which ACCOUNT_UPDATE keeps in sync, rather
+            // than dropping the close command.
+            verified_pos = risk_manager_->get_current_position();
+            std::cout << "⚠️ [IPC] Exchange verify failed; using synced position "
+                      << verified_pos << std::endl;
         }
-        risk_manager_->clear_stop();
+
+        std::string close_side;
+        if (action == "CLOSE_LONG") {
+            if (verified_pos <= 1e-12) {
+                std::cout << "⚪ [IPC] No long position; ignoring CLOSE_LONG." << std::endl;
+                return;
+            }
+            close_side = "SELL";
+        } else {
+            if (verified_pos >= -1e-12) {
+                std::cout << "⚪ [IPC] No short position; ignoring CLOSE_SHORT." << std::endl;
+                return;
+            }
+            close_side = "BUY";
+        }
+
+        // Close the full position; step/quantity rounding is handled by the
+        // executor (place_order_internal), and reduceOnly prevents a flip.
+        double close_quantity = std::abs(verified_pos);
+        std::cout << "🛡️ [Close " << (action == "CLOSE_LONG" ? "Long" : "Short")
+                  << "] qty=" << close_quantity << " | " << close_side << " + reduceOnly" << std::endl;
+        bool ok = executor_->send_order(symbol, close_side, close_quantity, price, true);
+        if (ok) {
+            risk_manager_->clear_stop();
+        }
     }
 }
 

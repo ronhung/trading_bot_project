@@ -14,6 +14,16 @@ void MockExecutor::set_market(const KLineData& bar) {
     current_bar_ = bar;
 }
 
+bool MockExecutor::get_current_position(const std::string& symbol, double& out_position) {
+    (void)symbol;
+    if (!risk_) {
+        out_position = 0.0;
+        return false;
+    }
+    out_position = risk_->get_current_position();
+    return true;
+}
+
 double MockExecutor::apply_slippage(const std::string& side, double price) const {
     const double slip = slippage_bps_ / 10000.0;
     if (side == "BUY") {

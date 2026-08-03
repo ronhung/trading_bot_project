@@ -38,4 +38,12 @@ public:
     // Returns true if there is any open (NEW / PARTIALLY_FILLED) order.
     // Used by IpcServer to reject duplicate open signals.
     virtual bool has_open_order() const { return false; }
+
+    // Query the current position on the exchange for the given symbol.
+    // Returns false if the executor cannot verify the position.
+    virtual bool get_current_position(const std::string& symbol, double& out_position) {
+        (void)symbol;
+        out_position = 0.0;
+        return false;
+    }
 };
