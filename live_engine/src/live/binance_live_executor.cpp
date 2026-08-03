@@ -186,6 +186,41 @@ bool BinanceLiveExecutor::send_order(const std::string& symbol,
 }
 
 // ---------------------------------------------------------------------------
+// Query order status by clientOrderId (REST fallback when WS is delayed/lost)
+// ---------------------------------------------------------------------------
+bool BinanceLiveExecutor::query_order_status(const std::string& symbol,
+                                              const std::string& client_order_id,
+                                              std::string& out_status) {
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+
+    std::string query_string = "symbol=" + symbol
+                             + "&origClientOrderId=" + client_order_id
+                             + "&timestamp=" + std::to_string(ms);
+    std::string signature = generate_signature(query_string);
+    std::string path = "/fapi/v1/order?" + query_string + "&signature=" + signature;
+
+    httplib::Headers headers = {
+        {"X-MBX-APIKEY", api_key_}
+    };
+
+    httplib::Client cli("https://testnet.binancefuture.com");
+    cli.set_connection_timeout(5);
+
+    auto res = cli.Get(path.c_str(), headers);
+    if (res && res->status == 200) {
+        try {
+            json j = json::parse(res->body);
+            out_status = j.value("status", "");
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "🔥 Failed to parse order query: " << e.what() << std::endl;
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Cancel an order by clientOrderId
 // ---------------------------------------------------------------------------
 bool BinanceLiveExecutor::cancel_order(const std::string& symbol, const std::string& client_order_id) {
@@ -327,6 +362,32 @@ void BinanceLiveExecutor::monitor_loop() {
         auto timed_out = order_tracker_.get_timed_out_orders(timeout_ms);
 
         for (auto& ord : timed_out) {
+            // ── Guard #1: verify the order still exists on the exchange ──
+            // Without this check, the monitor fires a cancel at an order that
+            // already filled/expired on the exchange but whose ORDER_TRADE_UPDATE
+            // hasn't arrived yet (or never will, e.g. listenKey expired).
+            // Binance responds with -2011 "Unknown order sent" and we never
+            // update the tracker → infinite retry loop every 10 s.
+            std::string exchange_status;
+            bool queried = query_order_status(ord.symbol, ord.client_order_id,
+                                              exchange_status);
+
+            if (queried && exchange_status != "NEW" &&
+                exchange_status != "PARTIALLY_FILLED") {
+                // Already terminal on the exchange — update tracker in-place
+                // and publish the real status so Python knows.  Do NOT cancel
+                // or reprice.
+                std::cout << "⚡ [OrderMonitor] " << ord.client_order_id
+                          << " already " << exchange_status
+                          << " on exchange; syncing tracker (no cancel)."
+                          << std::endl;
+
+                order_tracker_.on_order_update(ord.client_order_id,
+                                               exchange_status, ord.filled_quantity);
+                continue;  // ← skip cancel entirely
+            }
+
+            // ── Guard #2: proceed with cancel ──
             if (ord.reprice_attempts >= kMaxRepriceAttempts) {
                 // Exhausted: cancel and report
                 std::cout << "⏰ [OrderMonitor] " << ord.client_order_id
@@ -336,8 +397,6 @@ void BinanceLiveExecutor::monitor_loop() {
                 bool was_canceled = cancel_order(ord.symbol, ord.client_order_id);
 
                 if (was_canceled) {
-                    // Only mark terminal when the cancel genuinely succeeded.
-                    // Otherwise leave the order live — the WS will resolve it.
                     order_tracker_.mark_cancel_requested(ord.client_order_id);
 
                     OrderStatusUpdate u;
@@ -352,9 +411,19 @@ void BinanceLiveExecutor::monitor_loop() {
                     u.reason = "timeout_exhausted";
                     publish_status(u);
                 } else {
-                    std::cout << "⚠️ [OrderMonitor] Exhausted cancel failed for "
+                    // Cancel was rejected — even though we just queried and it
+                    // was open, a fill may have raced in.  Sync from the
+                    // exchange one more time so the tracker won't retry.
+                    std::cout << "⚠️ [OrderMonitor] Cancel rejected for "
                               << ord.client_order_id
-                              << " — awaiting WS event." << std::endl;
+                              << " — syncing from exchange." << std::endl;
+
+                    std::string post_status;
+                    if (query_order_status(ord.symbol, ord.client_order_id,
+                                           post_status)) {
+                        order_tracker_.on_order_update(ord.client_order_id,
+                                                       post_status, 0.0);
+                    }
                 }
 
             } else {
@@ -383,11 +452,19 @@ void BinanceLiveExecutor::monitor_loop() {
 
                     reprice_order(ord);
                 } else {
-                    // Cancel failed — order may have filled or network error.
-                    // Leave the order in the tracker; WS ORDER_TRADE_UPDATE
-                    // will resolve it.  Do NOT reprice (would double-fill).
-                    std::cout << "⚠️ [OrderMonitor] Cancel failed for " << ord.client_order_id
-                              << " — awaiting WS event; will not reprice." << std::endl;
+                    // Cancel was rejected — sync from exchange to prevent
+                    // infinite retry.  Do NOT reprice (would double-fill).
+                    std::cout << "⚠️ [OrderMonitor] Cancel rejected for "
+                              << ord.client_order_id
+                              << " — syncing from exchange; will not reprice."
+                              << std::endl;
+
+                    std::string post_status;
+                    if (query_order_status(ord.symbol, ord.client_order_id,
+                                           post_status)) {
+                        order_tracker_.on_order_update(ord.client_order_id,
+                                                       post_status, 0.0);
+                    }
                 }
             }
         }
@@ -432,6 +509,29 @@ bool BinanceLiveExecutor::get_current_position(const std::string& symbol, double
 
     std::cerr << "❌ Failed to query exchange position! Status: "
               << (res ? std::to_string(res->status) : "connection error") << std::endl;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Keepalive: PUT /fapi/v1/listenKey  (Binance requires every 30 min)
+// ---------------------------------------------------------------------------
+bool BinanceLiveExecutor::keep_alive_listen_key(const std::string& listen_key) {
+    httplib::Client cli("https://testnet.binancefuture.com");
+    cli.set_connection_timeout(5);
+
+    httplib::Headers headers = {
+        {"X-MBX-APIKEY", api_key_}
+    };
+
+    auto res = cli.Put("/fapi/v1/listenKey", headers, "", "application/x-www-form-urlencoded");
+
+    if (res && res->status == 200) {
+        return true;
+    }
+
+    std::cerr << "⚠️  [Keepalive] PUT listenKey failed: "
+              << (res ? std::to_string(res->status) + " " + res->body : "connection error")
+              << std::endl;
     return false;
 }
 

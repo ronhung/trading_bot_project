@@ -84,30 +84,26 @@ int main() {
 
         std::string listen_key = executor.get_listen_key();
         ix::WebSocket user_ws;
+        std::atomic<bool> ws_needs_reconnect{false};
+        std::mutex ws_mutex;  // guards user_ws start/stop from within callback
 
         if (!listen_key.empty()) {
             std::string user_ws_url = "wss://stream.binancefuture.com/ws/" + listen_key;
             user_ws.setUrl(user_ws_url);
 
-            user_ws.setOnMessageCallback([&risk_manager, &executor](const ix::WebSocketMessagePtr& msg) {
+            user_ws.setOnMessageCallback([&](const ix::WebSocketMessagePtr& msg) {
                 if (msg->type == ix::WebSocketMessageType::Message) {
                     try {
                         json j = json::parse(msg->str);
                         if (j.contains("e") && j["e"] == "ORDER_TRADE_UPDATE") {
-                            // Handle order status updates (fills, cancels, etc.)
                             if (j.contains("o")) {
                                 auto& o = j["o"];
                                 std::string client_id = o.value("c", "");
-                                std::string status = o.value("X", "");  // NEW, PARTIALLY_FILLED, FILLED, CANCELED...
+                                std::string status = o.value("X", "");
                                 double filled_qty = std::stod(o.value("z", "0"));
                                 if (!client_id.empty()) {
                                     executor.on_order_update(client_id, status, filled_qty);
                                 }
-                                // NOTE: RiskManager position/balance are intentionally
-                                // NOT updated from ORDER_TRADE_UPDATE — it carries no
-                                // position amount, and deriving one via fill deltas races
-                                // with ACCOUNT_UPDATE. The ACCOUNT_UPDATE handler below is
-                                // the single authoritative source of position/balance.
                             }
                         } else if (j.contains("e") && j["e"] == "ACCOUNT_UPDATE") {
                             auto& account = j["a"];
@@ -137,6 +133,14 @@ int main() {
                     }
                 } else if (msg->type == ix::WebSocketMessageType::Open) {
                     std::cout << "🟢 [Private radar] Connected to Binance server!" << std::endl;
+                } else if (msg->type == ix::WebSocketMessageType::Close) {
+                    std::cout << "🔴 [Private radar] Disconnected (reason: "
+                              << msg->errorInfo.reason << "). Flagging reconnect..."
+                              << std::endl;
+                    ws_needs_reconnect = true;
+                } else if (msg->type == ix::WebSocketMessageType::Error) {
+                    std::cerr << "⚠️  [Private radar] WebSocket error: "
+                              << msg->errorInfo.reason << std::endl;
                 }
             });
             user_ws.start();
@@ -152,9 +156,43 @@ int main() {
         ws.connect_and_stream("BTCUSDT");
 
         KLineData current_kline;
+        auto last_keepalive = std::chrono::steady_clock::now();
+        static constexpr auto kKeepaliveInterval = std::chrono::minutes(25);
+
         std::cout << "⚙️ Engine main loop is ready, waiting for market data..." << std::endl;
 
         while (true) {
+            // ── Keepalive: extend listenKey TTL (Binance requires every 30 min) ──
+            auto now = std::chrono::steady_clock::now();
+            if (!listen_key.empty() && (now - last_keepalive) >= kKeepaliveInterval) {
+                if (executor.keep_alive_listen_key(listen_key)) {
+                    std::cout << "🔄 [Keepalive] listenKey extended." << std::endl;
+                }
+                last_keepalive = now;
+            }
+
+            // ── Reconnect: private WS dropped → new key → restart ──
+            if (ws_needs_reconnect.exchange(false)) {
+                std::cout << "🔧 [Reconnect] Requesting new listenKey..." << std::endl;
+                std::string new_key = executor.get_listen_key();
+                if (!new_key.empty()) {
+                    listen_key = new_key;
+                    std::string new_url = "wss://stream.binancefuture.com/ws/" + listen_key;
+                    {
+                        std::lock_guard<std::mutex> lk(ws_mutex);
+                        user_ws.stop();
+                        user_ws.setUrl(new_url);
+                        user_ws.start();
+                    }
+                    last_keepalive = std::chrono::steady_clock::now();
+                    std::cout << "✅ [Reconnect] Private WS restarted with new key." << std::endl;
+                } else {
+                    std::cerr << "❌ [Reconnect] Failed to get new listenKey; "
+                              << "will retry on next cycle." << std::endl;
+                    ws_needs_reconnect = true;  // retry next iteration
+                }
+            }
+
             // Flush any queued order status updates to Python (PUB socket, main thread only)
             ipc.pump_order_updates();
 

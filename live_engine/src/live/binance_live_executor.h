@@ -29,13 +29,24 @@ public:
     bool get_initial_state(double& out_usdt_balance, double& out_btcusdt_position);
 
     // User data stream listen key
-    std::string get_listen_key();
+    std::string get_listen_key();       // POST — create new listenKey
+    bool keep_alive_listen_key(const std::string& listen_key);  // PUT — extend TTL
 
     // Query the current exchange position for a symbol.
     bool get_current_position(const std::string& symbol, double& out_position) override;
 
-    // Cancel an order by clientOrderId
+    // Cancel an order by clientOrderId.
+    // Returns true only if the cancel was accepted AND the order transitioned
+    // to CANCELED.  Returns false if the order was already terminal (filled /
+    // expired / not found) or a network error occurred.
     bool cancel_order(const std::string& symbol, const std::string& client_order_id);
+
+    // Query the current exchange status of an order by clientOrderId.
+    // out_status is set to the Binance status string (NEW, FILLED, CANCELED, …).
+    // Returns false on network/parse failure.
+    bool query_order_status(const std::string& symbol,
+                            const std::string& client_order_id,
+                            std::string& out_status);
 
     // Order monitor lifecycle (called from main)
     void start_order_monitor();
