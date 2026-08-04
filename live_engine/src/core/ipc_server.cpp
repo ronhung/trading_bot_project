@@ -191,7 +191,7 @@ void IpcServer::handle_message(const std::string& msg_str) {
     if (action == "BUY" || action == "SELL") {
         // One-position rule: refuse to pyramid / flip without an explicit CLOSE_*.
         double cur_pos = risk_manager_->get_current_position();
-        if (std::abs(cur_pos) > 1e-12) {
+        if (RiskManager::is_effective_position(cur_pos)) {
             std::cout << "🚫 [IPC] Already in position (" << cur_pos
                       << "); ignore open until CLOSE_*." << std::endl;
             return;
@@ -230,13 +230,13 @@ void IpcServer::handle_message(const std::string& msg_str) {
 
         std::string close_side;
         if (action == "CLOSE_LONG") {
-            if (verified_pos <= 1e-12) {
+            if (!RiskManager::is_effective_position(verified_pos) || verified_pos <= 0.0) {
                 std::cout << "⚪ [IPC] No long position; ignoring CLOSE_LONG." << std::endl;
                 return;
             }
             close_side = "SELL";
         } else {
-            if (verified_pos >= -1e-12) {
+            if (!RiskManager::is_effective_position(verified_pos) || verified_pos >= 0.0) {
                 std::cout << "⚪ [IPC] No short position; ignoring CLOSE_SHORT." << std::endl;
                 return;
             }

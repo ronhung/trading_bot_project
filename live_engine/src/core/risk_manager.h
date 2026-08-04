@@ -23,6 +23,11 @@ public:
     double get_entry_price();
     void set_entry_price(double entry_price);
 
+    static constexpr double kMinTradeQty = 0.001;
+    static bool is_effective_position(double position) {
+        return std::abs(position) >= kMinTradeQty;
+    }
+
 private:
     double risk_pct_;
     double max_leverage_;

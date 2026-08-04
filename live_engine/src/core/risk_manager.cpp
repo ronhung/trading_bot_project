@@ -15,10 +15,12 @@ void RiskManager::update_balance(double new_balance) {
 
 void RiskManager::update_position(double new_position_size) {
     std::lock_guard<std::mutex> lock(mtx_);
-    current_position_ = new_position_size;
-    if (std::abs(current_position_) < 1e-12) {
+    if (std::abs(new_position_size) < kMinTradeQty) {
+        current_position_ = 0.0;
         stop_price_ = 0.0;
         entry_price_ = 0.0;
+    } else {
+        current_position_ = new_position_size;
     }
 }
 
