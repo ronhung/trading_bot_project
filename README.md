@@ -190,7 +190,75 @@ backtest_engine.exe <csv_path> <trades_output_path> <initial_balance>
 
 ---
 
-## 4. Live Trading (Binance Testnet)
+## 4. Research Toolkit — ML Dataset Builder & Parameter Sweeps
+
+Pure pandas/numpy research modules for systematic strategy development. No Backtrader dependency — signals are vectorized for speed.
+
+```bash
+cd research
+
+# Build ML pretrain dataset (X, y) from historical data
+python build_2024_dataset.py
+
+# Run all self-tests
+python -m research.labeling        # triple-barrier labeler
+python -m research.features        # indicator precomputation + feature pipeline
+python -m research.dataset_builder # build_ml_dataset() demo
+python -m research.backtest        # vectorized backtest demo (~50-200x faster than Backtrader)
+python -m research.param_sweep     # multiprocessing grid search demo
+```
+
+### 4.1 `build_ml_dataset()` — raw klines → (X, y)
+
+```python
+from research.dataset_builder import build_ml_dataset, make_turtle_breakout_trigger
+from research.features import add_indicators, default_feature_pipeline
+
+df = add_indicators(raw_data)
+trigger = make_turtle_breakout_trigger(entry_period=20, atr_period=20, signed=True)
+X, meta = build_ml_dataset(df, trigger, default_feature_pipeline(),
+                            {"upper_barrier": 0.02, "lower_barrier": -0.01, "horizon": 288})
+# X: DataFrame with 12 features + triple-barrier labels (1=TP, -1=SL, 0=timeout)
+```
+
+### 4.2 `lightweight_backtest()` — vectorized backtester
+
+```python
+from research.backtest import lightweight_backtest
+
+result = lightweight_backtest(df, entry_period=20, exit_period=10,
+                               atr_period=20, atr_mult=2.0)
+# ~0.02s per run on synthetic data — suitable for large parameter sweeps
+```
+
+### 4.3 `run_parameter_sweep()` — multiprocessing grid search
+
+```python
+from research.param_sweep import run_parameter_sweep
+from research.param_sweep import _backtest_target, _dataset_target
+
+results = run_parameter_sweep(
+    target_func=_backtest_target,
+    param_grid={"entry_period": [10, 20, 40], "atr_mult": [1.5, 2.0, 3.0]},
+    raw_data=raw_data,
+    n_jobs=-1,
+    rank_by="sharpe",
+)
+```
+
+### 4.4 Module overview
+
+| Module | Purpose |
+|--------|---------|
+| `research/labeling.py` | Triple-barrier labeler (vectorized + reference implementation) |
+| `research/features.py` | `add_indicators()` + 8 feature callables (zero-lookahead guaranteed) |
+| `research/dataset_builder.py` | `build_ml_dataset()` orchestrator + synthetic data generator |
+| `research/backtest.py` | `lightweight_backtest()` — pure vectorized, no Backtrader dependency |
+| `research/param_sweep.py` | `run_parameter_sweep()` — grid expansion + `ProcessPoolExecutor` |
+
+---
+
+## 5. Live Trading (Binance Testnet)
 
 ```bash
 # Terminal 1 — C++ live engine
@@ -245,7 +313,7 @@ The Python bot:
 
 ---
 
-## 5. IPC Protocol (C++ ↔ Python over ZMQ)
+## 6. IPC Protocol (C++ ↔ Python over ZMQ)
 
 | Direction | Pattern | Port | Content |
 |-----------|---------|------|---------|
@@ -280,7 +348,7 @@ Behaviour:
 
 ---
 
-## 6. Directory Structure (key files)
+## 7. Directory Structure (key files)
 
 ```
 shared/config.json                     API keys, ZMQ ports, backtest params
@@ -288,6 +356,12 @@ shared/core_logic/turtle_math.py       THE strategy brain (single source of trut
 data/download_binance_data.py          kline/funding downloader + CSV export
 backtesting/run_backtest.py            Path A Backtrader backtest
 backtesting/plot_results.py            Visualize Path B trade CSV
+research/labeling.py                  triple-barrier labeler (vectorized + reference)
+research/features.py                  add_indicators() + feature pipeline
+research/dataset_builder.py           build_ml_dataset() + synthetic data
+research/backtest.py                  lightweight_backtest() — ~50-200x faster than Backtrader
+research/param_sweep.py               run_parameter_sweep() — multiprocessing grid search
+research/build_2024_dataset.py        one-shot 2024 ML pretrain dataset builder
 live_engine/src/core/                  ipc_server, risk_manager, i_order_executor, thread_safe_queue
 live_engine/src/backtest/              main_backtest, mock_executor, data_replayer
 live_engine/src/live/                  main_live, binance_ws, binance_live_executor, order_tracker
@@ -297,7 +371,7 @@ live_strategy/zmq_client.py            ZMQ SUB/PUSH client
 
 ---
 
-## 7. Dependencies
+## 8. Dependencies
 
 **Python:** `backtrader`, `pandas`, `numpy`, `pyzmq`, `requests`, `matplotlib`, `pyarrow` / `fastparquet`.
 
