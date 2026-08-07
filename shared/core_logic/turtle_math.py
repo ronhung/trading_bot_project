@@ -1,9 +1,10 @@
 import pandas as pd
 import numpy as np
 
-def calculate_turtle_signals(df: pd.DataFrame, entry_period: int, exit_period: int, atr_period: int, atr_mult: float):
+def calculate_turtle_signals(df: pd.DataFrame, entry_period: int, exit_period: int, atr_period: int, atr_mult: float, intensity_threshold: float = 0.0):
     """
     Pure math function: calculate Turtle Trading entry/exit signals and stop price.
+    Added 'intensity_threshold' to filter out weak fake breakouts.
     Returns: (signal, stop_price)
              signal: 1 (long), -1 (short), 2 (close long), -2 (close short), 0 (hold)
     """
@@ -29,11 +30,19 @@ def calculate_turtle_signals(df: pd.DataFrame, entry_period: int, exit_period: i
     # 3. Determine the signal
     signal = 0
     stop_price = None
+    
+    # 防呆：確保 ATR 已經計算出來且大於 0，避免除以零的錯誤
+    valid_atr = current['atr'] if pd.notna(current['atr']) and current['atr'] > 0 else 1.0
 
-    if current['close'] > current['entry_high']:
+    # 計算多空突破的 Intensity
+    long_intensity = (current['close'] - current['entry_high']) / valid_atr
+    short_intensity = (current['entry_low'] - current['close']) / valid_atr
+
+    # 加入 intensity_threshold 濾網判斷
+    if long_intensity > intensity_threshold:
         signal = 1
         stop_price = current['close'] - (current['atr'] * atr_mult)
-    elif current['close'] < current['entry_low']:
+    elif short_intensity > intensity_threshold:
         signal = -1
         stop_price = current['close'] + (current['atr'] * atr_mult)
     elif current['close'] < current['exit_low']:

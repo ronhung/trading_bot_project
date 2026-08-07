@@ -65,6 +65,7 @@ class LiveTurtleBot:
         self.exit_period = 1
         self.atr_period = 2
         self.atr_mult = 2.0
+        self.intensity_threshold = 0.0
         
         # buffer size setting (keep enough history for Donchian channels and ATR)
         self.max_len = max(self.entry_period, self.atr_period) + 1
@@ -175,7 +176,8 @@ class LiveTurtleBot:
             self.entry_period,
             self.exit_period,
             self.atr_period,
-            self.atr_mult
+            self.atr_mult,
+            self.intensity_threshold
         )
 
         current = df.iloc[-1]

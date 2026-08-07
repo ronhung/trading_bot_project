@@ -23,7 +23,7 @@ def main():
     # Define the test time range (recommended: run 3 months first, then full 6 years)
     # When loading DataFeed, you can pass fromdate and todate directly
     start_date = datetime.datetime(2023, 1, 1)
-    end_date = datetime.datetime(2025, 1, 1)
+    end_date = datetime.datetime(2024, 1, 1)
 
     # Resolve current script directory and build data paths dynamically
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

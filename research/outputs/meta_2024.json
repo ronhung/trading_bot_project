@@ -1,0 +1,43 @@
+{
+  "n_events": 69841,
+  "n_events_labeled": 69841,
+  "n_truncated": 42,
+  "coverage": 0.13251555859137826,
+  "label_counts": {
+    "0": 42365,
+    "-1": 20454,
+    "1": 7022
+  },
+  "label_rates": {
+    "0": 0.6065921163786314,
+    "-1": 0.29286522243381397,
+    "1": 0.10054266118755459
+  },
+  "barrier_hit_counts": {
+    "timeout": 42365,
+    "lower": 20454,
+    "upper": 7022
+  },
+  "mean_actual_return": -2.3924524352956705e-05,
+  "median_actual_return": -0.0009308563761330822,
+  "mean_n_bars_held": 227.33924199252587,
+  "feature_names": [
+    "atr",
+    "atr_pct",
+    "long_intensity",
+    "short_intensity",
+    "vol_ratio",
+    "vol_zscore",
+    "channel_pos",
+    "channel_width_pct",
+    "ret_5",
+    "ret_10",
+    "ret_30",
+    "taker_buy_ratio"
+  ],
+  "config": {
+    "upper_barrier": 0.02,
+    "lower_barrier": -0.01,
+    "horizon": 288
+  }
+}
