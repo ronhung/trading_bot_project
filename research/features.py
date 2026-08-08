@@ -88,6 +88,14 @@ def add_indicators(
     for p in [5, 10, 30]:
         out[f"ret_{p}"] = out["close"] / out["close"].shift(p) - 1.0
 
+    # --- 200-period moving average (trend filter) ---
+    out["ma_200"] = out["close"].rolling(200).mean().shift(1)
+
+    # --- Daily ATR as percentage of price (for volatility normalization) ---
+    # atr is absolute ($); divide by close to get decimal; rolling 1440 smooths it
+    atr_pct_raw = out["atr"] / out["close"]
+    out["atr_daily"] = atr_pct_raw.rolling(1440).mean()  # ~1-day ATR as fraction of price
+
     # --- Taker flow (if columns exist in the data) ---
     if "taker_buy_base" in out.columns and "volume" in out.columns:
         out["taker_buy_ratio"] = (
@@ -207,6 +215,27 @@ def feature_taker_flow(df: pd.DataFrame, idx: int,
     return {"taker_buy_ratio": ratio}
 
 
+def feature_trend_filter(df: pd.DataFrame, idx: int,
+                          ma_period: int = 200) -> Dict[str, float]:
+    """200MA direction: +1 uptrend, -1 downtrend, and price-vs-MA ratio."""
+    ma_val = _safe_loc(df, idx, "ma_200")
+    close = df["close"].iloc[idx]
+
+    if pd.isna(ma_val) or ma_val <= 0:
+        trend_direction = 0.0
+        ma_ratio = 1.0
+    else:
+        ma_ratio = close / ma_val
+        if ma_ratio > 1.01:
+            trend_direction = 1.0   # uptrend
+        elif ma_ratio < 0.99:
+            trend_direction = -1.0  # downtrend
+        else:
+            trend_direction = 0.0   # sideways
+
+    return {"trend_direction": trend_direction, "ma_ratio": ma_ratio}
+
+
 def feature_hour_of_day(df: pd.DataFrame, idx: int) -> Dict[str, float]:
     """Hour of day (0-23) from datetime index — captures intraday seasonality."""
     if hasattr(df.index, "hour"):
@@ -257,6 +286,7 @@ def default_feature_pipeline() -> FeatureFunc:
         feature_donchian_width,
         feature_lagged_returns,
         feature_taker_flow,
+        feature_trend_filter,
     ])
 
 

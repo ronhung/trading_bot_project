@@ -1,22 +1,22 @@
 {
-  "n_events": 458,
-  "n_events_labeled": 458,
-  "n_truncated": 2,
-  "coverage": 0.0008690042501517911,
+  "n_events": 1097,
+  "n_events_labeled": 1097,
+  "n_truncated": 0,
+  "coverage": 0.0005214334333420793,
   "label_counts": {
-    "1": 293,
-    "-1": 165
+    "1": 650,
+    "-1": 447
   },
   "label_rates": {
-    "1": 0.6397379912663755,
-    "-1": 0.36026200873362446
+    "1": 0.5925250683682771,
+    "-1": 0.4074749316317229
   },
   "barrier_hit_counts": {
-    "fixed_horizon": 458
+    "fixed_horizon": 1097
   },
-  "mean_actual_return": 0.03374536599906227,
-  "median_actual_return": 0.037147629940148974,
-  "mean_n_bars_held": 14345.816593886462,
+  "mean_actual_return": 0.034860387294396056,
+  "median_actual_return": 0.024025200190099995,
+  "mean_n_bars_held": 14400.0,
   "feature_names": [
     "atr",
     "atr_pct",

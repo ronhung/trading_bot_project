@@ -246,15 +246,43 @@ results = run_parameter_sweep(
 )
 ```
 
-### 4.4 Module overview
+### 4.4 Phase 3 — ML Signal Analysis (XGBoost + IC + ML-filtered Backtest)
+
+Train/test pipeline with fixed-horizon labeling and XGBoost ranking:
+
+```bash
+# 1. Build train (2020-2023) + test (2024) datasets
+python research/build_train_test_dataset.py
+
+# 2. Train XGBoost, evaluate Spearman IC + Decile staircase
+python research/ml_analysis.py
+# Output: xgb_model.json (saved model), Spearman IC, decile table
+
+# 3. Backtest with ML filter — only enter breakouts the model approves
+python research/backtest.py --real --year 2024 \
+    --entry 28800 --exit 14400 --atr-period 28800 --atr-mult 4.0 \
+    --ml-filter --ml-threshold 50
+```
+
+Key results (20-day Turtle, TP=4×ATR SL, 2024 out-of-sample):
+
+| ML Threshold | Trades | Return | Sharpe |
+|-------------|--------|--------|--------|
+| None | 83 | -5% | 0.42 |
+| pred > 50 | 55 | +102% | 0.92 |
+| pred > 100 | 10 | +266% | 1.58 |
+
+### 4.5 Module overview
 
 | Module | Purpose |
 |--------|---------|
-| `research/labeling.py` | Triple-barrier labeler (vectorized + reference implementation) |
-| `research/features.py` | `add_indicators()` + 8 feature callables (zero-lookahead guaranteed) |
-| `research/dataset_builder.py` | `build_ml_dataset()` orchestrator + synthetic data generator |
-| `research/backtest.py` | `lightweight_backtest()` — pure vectorized, no Backtrader dependency |
+| `research/labeling.py` | Triple-barrier + fixed-horizon labelers |
+| `research/features.py` | `add_indicators()` + 14 feature callables |
+| `research/dataset_builder.py` | `build_ml_dataset()` orchestrator + synthetic data |
+| `research/backtest.py` | `lightweight_backtest()` + `--ml-filter` XGBoost integration |
 | `research/param_sweep.py` | `run_parameter_sweep()` — grid expansion + `ProcessPoolExecutor` |
+| `research/build_train_test_dataset.py` | One-shot 2020-2023/2024 dataset builder |
+| `research/ml_analysis.py` | XGBoost regressor + Spearman IC + decile analysis |
 
 ---
 
@@ -361,7 +389,9 @@ research/features.py                  add_indicators() + feature pipeline
 research/dataset_builder.py           build_ml_dataset() + synthetic data
 research/backtest.py                  lightweight_backtest() — ~50-200x faster than Backtrader
 research/param_sweep.py               run_parameter_sweep() — multiprocessing grid search
-research/build_2024_dataset.py        one-shot 2024 ML pretrain dataset builder
+research/build_2024_dataset.py        one-shot 2024 ML pretrain dataset
+research/build_train_test_dataset.py  train (2020-2023) / test (2024) dataset builder
+research/ml_analysis.py               XGBoost regressor + Spearman IC + decile analysis
 live_engine/src/core/                  ipc_server, risk_manager, i_order_executor, thread_safe_queue
 live_engine/src/backtest/              main_backtest, mock_executor, data_replayer
 live_engine/src/live/                  main_live, binance_ws, binance_live_executor, order_tracker

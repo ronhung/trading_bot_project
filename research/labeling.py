@@ -31,6 +31,8 @@ def apply_triple_barrier(
     horizon: int = 288,
     side: Union[int, np.ndarray] = 1,
     chunk_size: int = 5000,
+    barrier_mode: str = "pct",
+    atr_values: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """
     Vectorized triple-barrier labeler.
@@ -83,10 +85,24 @@ def apply_triple_barrier(
             "entry_price", "exit_price", "actual_return", "truncated",
         ])
 
-    if upper_barrier <= 0:
-        raise ValueError(f"upper_barrier must be > 0, got {upper_barrier}")
-    if lower_barrier >= 0:
-        raise ValueError(f"lower_barrier must be < 0, got {lower_barrier}")
+    if barrier_mode not in ("pct", "atr"):
+        raise ValueError(f"barrier_mode must be 'pct' or 'atr', got {barrier_mode}")
+
+    if barrier_mode == "atr":
+        if atr_values is None:
+            raise ValueError("atr_values is required when barrier_mode='atr'")
+        atr_arr = np.asarray(atr_values, dtype=float)
+        upper_mult = float(upper_barrier)  # e.g., 2.0 for 2x ATR
+        lower_mult = float(abs(lower_barrier))  # e.g., 1.0 for 1x ATR (abs of -1.0)
+        if upper_mult <= 0:
+            raise ValueError(f"upper_barrier (ATR multiplier) must be > 0, got {upper_mult}")
+        if lower_mult <= 0:
+            raise ValueError(f"lower_barrier (ATR multiplier) must be > 0, got {lower_mult}")
+    else:
+        if upper_barrier <= 0:
+            raise ValueError(f"upper_barrier must be > 0, got {upper_barrier}")
+        if lower_barrier >= 0:
+            raise ValueError(f"lower_barrier must be < 0, got {lower_barrier}")
 
     n = len(close_arr)
 
@@ -94,19 +110,42 @@ def apply_triple_barrier(
     entry_prices = close_arr[ev]
 
     # --- compute barrier prices (side-aware) ---
-    # Long:  tp = entry * (1 + ub),  sl = entry * (1 + lb)
-    # Short: tp = entry / (1 + ub),  sl = entry / (1 + lb)
     is_long = side_arr == 1
-    tp_price = np.where(
-        is_long,
-        entry_prices * (1.0 + upper_barrier),
-        entry_prices / (1.0 + upper_barrier),
-    )
-    sl_price = np.where(
-        is_long,
-        entry_prices * (1.0 + lower_barrier),
-        entry_prices / (1.0 + lower_barrier),
-    )
+
+    if barrier_mode == "atr":
+        # ATR-based absolute barriers
+        atr_entry = atr_arr[ev]  # ATR value at each event bar
+        # Long:  tp = entry + upper_mult * ATR,  sl = entry - lower_mult * ATR
+        # Short: tp = entry - upper_mult * ATR,  sl = entry + lower_mult * ATR
+        tp_price = np.where(
+            is_long,
+            entry_prices + upper_mult * atr_entry,
+            entry_prices - upper_mult * atr_entry,
+        )
+        sl_price = np.where(
+            is_long,
+            entry_prices - lower_mult * atr_entry,
+            entry_prices + lower_mult * atr_entry,
+        )
+        # Guard: tp must be profitable direction, sl must be losing direction
+        tp_price = np.where(is_long, np.maximum(tp_price, entry_prices + 1e-8),
+                                     np.minimum(tp_price, entry_prices - 1e-8))
+        sl_price = np.where(is_long, np.minimum(sl_price, entry_prices - 1e-8),
+                                     np.maximum(sl_price, entry_prices + 1e-8))
+    else:
+        # Percentage-based barriers (original behavior)
+        # Long:  tp = entry * (1 + ub),  sl = entry * (1 + lb)
+        # Short: tp = entry / (1 + ub),  sl = entry / (1 + lb)
+        tp_price = np.where(
+            is_long,
+            entry_prices * (1.0 + upper_barrier),
+            entry_prices / (1.0 + upper_barrier),
+        )
+        sl_price = np.where(
+            is_long,
+            entry_prices * (1.0 + lower_barrier),
+            entry_prices / (1.0 + lower_barrier),
+        )
 
     # --- pad arrays so out-of-range lookups never "hit" ---
     # high padded with -inf  → never >= tp_price
@@ -215,6 +254,18 @@ def apply_triple_barrier(
             np.log(entry_chunk / exit_prices),
         )
 
+        # Volatility-normalized return (ATR units) — only when barrier_mode="atr"
+        if barrier_mode == "atr":
+            atr_entry_chunk = atr_arr[ev_chunk]
+            safe_atr = np.where(atr_entry_chunk > 1e-12, atr_entry_chunk, 1.0)
+            return_atr = np.where(
+                is_long_chunk,
+                (exit_prices - entry_chunk) / safe_atr,
+                (entry_chunk - exit_prices) / safe_atr,
+            )
+        else:
+            return_atr = np.full(m, np.nan)
+
         chunk_df = pd.DataFrame({
             "label": label,
             "barrier_hit": barrier_hit,
@@ -223,6 +274,7 @@ def apply_triple_barrier(
             "entry_price": entry_chunk,
             "exit_price": exit_prices,
             "actual_return": actual_return,
+            "return_atr": return_atr,
             "truncated": truncated,
         }, index=ev_chunk)
         chunk_df.index.name = "event_idx"
@@ -242,6 +294,8 @@ def apply_triple_barrier_loop(
     lower_barrier: float = -0.01,
     horizon: int = 288,
     side: Union[int, np.ndarray] = 1,
+    barrier_mode: str = "pct",
+    atr_values: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """
     Reference implementation: per-event Python loop.
@@ -254,18 +308,32 @@ def apply_triple_barrier_loop(
     ev = np.asarray(events, dtype=int)
     side_arr = np.full(len(ev), side, dtype=int) if np.ndim(side) == 0 else np.asarray(side, dtype=int)
 
+    if barrier_mode == "atr":
+        atr_arr = np.asarray(atr_values, dtype=float)
+        upper_mult = float(upper_barrier)
+        lower_mult = float(abs(lower_barrier))
+
     n = len(close_arr)
     rows = []
 
     for k, (i, s) in enumerate(zip(ev, side_arr)):
         entry = close_arr[i]
 
-        if s == 1:  # long
-            tp = entry * (1.0 + upper_barrier)
-            sl = entry * (1.0 + lower_barrier)
-        else:  # short
-            tp = entry / (1.0 + upper_barrier)
-            sl = entry / (1.0 + lower_barrier)
+        if barrier_mode == "atr":
+            atr_entry = atr_arr[i]
+            if s == 1:  # long
+                tp = entry + upper_mult * atr_entry
+                sl = entry - lower_mult * atr_entry
+            else:  # short
+                tp = entry - upper_mult * atr_entry
+                sl = entry + lower_mult * atr_entry
+        else:
+            if s == 1:  # long
+                tp = entry * (1.0 + upper_barrier)
+                sl = entry * (1.0 + lower_barrier)
+            else:  # short
+                tp = entry / (1.0 + upper_barrier)
+                sl = entry / (1.0 + lower_barrier)
 
         end = min(i + horizon + 1, n)
         label = 0
@@ -307,8 +375,12 @@ def apply_triple_barrier_loop(
 
         if s == 1:
             ret = np.log(exit_px / entry)
+            safe_atr = atr_entry if (barrier_mode == "atr" and atr_entry > 1e-12) else 1.0
+            ret_atr = (exit_px - entry) / safe_atr if barrier_mode == "atr" else np.nan
         else:
             ret = np.log(entry / exit_px)
+            safe_atr = atr_entry if (barrier_mode == "atr" and atr_entry > 1e-12) else 1.0
+            ret_atr = (entry - exit_px) / safe_atr if barrier_mode == "atr" else np.nan
 
         rows.append({
             "label": label,
@@ -318,10 +390,73 @@ def apply_triple_barrier_loop(
             "entry_price": entry,
             "exit_price": exit_px,
             "actual_return": ret,
+            "return_atr": ret_atr,
             "truncated": truncated and label == 0,
         })
 
     out = pd.DataFrame(rows, index=ev)
+    out.index.name = "event_idx"
+    return out
+
+
+# ============================================================
+# 3. Fixed-horizon labeler (no barriers, just forward return / ATR)
+# ============================================================
+
+def fixed_horizon_label(
+    close: Union[np.ndarray, pd.Series],
+    events: Union[np.ndarray, list],
+    sides: Union[int, np.ndarray],
+    daily_atr: Union[np.ndarray, pd.Series],
+    horizon: int = 14400,
+) -> pd.DataFrame:
+    """
+    Fixed-horizon labeling: forward return normalized by daily ATR.
+
+    y_norm = (exit_price - entry_price) / daily_atr_at_event   (trade-side aware)
+
+    Parameters
+    ----------
+    close : 1-D array of closing prices.
+    events : array of event bar positions.
+    sides : 1 or -1 per event (trade direction).
+    daily_atr : 1-D array of daily ATR values (same length as close).
+    horizon : forward bars to look (default 14400 = 10 days at 1m).
+
+    Returns
+    -------
+    pd.DataFrame with columns: y_norm, raw_return, entry_price, exit_price
+    """
+    close_arr = np.asarray(close, dtype=float)
+    atr_arr = np.asarray(daily_atr, dtype=float)
+    ev = np.asarray(events, dtype=int)
+    side_arr = np.full(len(ev), sides, dtype=int) if np.ndim(sides) == 0 else np.asarray(sides, dtype=int)
+
+    n = len(close_arr)
+    entry_prices = close_arr[ev]
+    exit_indices = np.minimum(ev + horizon, n - 1)
+    exit_prices = close_arr[exit_indices]
+    atr_entry = atr_arr[ev]
+
+    # Trade-side raw return
+    is_long = side_arr == 1
+    raw_return = np.where(
+        is_long,
+        (exit_prices - entry_prices) / entry_prices,
+        (entry_prices - exit_prices) / entry_prices,
+    )
+
+    # Volatility normalization (guard against zero/NaN ATR)
+    safe_atr = np.where((~np.isnan(atr_entry)) & (atr_entry > 1e-12), atr_entry, 1.0)
+    y_norm = raw_return / safe_atr
+
+    out = pd.DataFrame({
+        "y_norm": y_norm,
+        "raw_return": raw_return,
+        "entry_price": entry_prices,
+        "exit_price": exit_prices,
+        "exit_idx": exit_indices,
+    }, index=ev)
     out.index.name = "event_idx"
     return out
 

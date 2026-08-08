@@ -23,7 +23,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from research.labeling import apply_triple_barrier
+from research.labeling import apply_triple_barrier, fixed_horizon_label
 from research.features import add_indicators, make_feature_pipeline, FeatureFunc
 
 
@@ -271,10 +271,11 @@ def build_ml_dataset(
     df = raw_data.copy()
 
     # --- Extract config with defaults ---
+    method = labeling_config.get("method", "triple_barrier")
     ub = labeling_config.get("upper_barrier", 0.02)
     lb = labeling_config.get("lower_barrier", -0.01)
     horizon = labeling_config.get("horizon", 288)
-    exit_price_mode = labeling_config.get("exit_price_mode", "close")
+    barrier_mode = labeling_config.get("barrier_mode", "pct")
 
     # --- Step 1: Run event trigger ---
     event_series = event_trigger(df)
@@ -327,16 +328,47 @@ def build_ml_dataset(
     high_arr = df["high"].values
     low_arr = df["low"].values
 
-    labels_df = apply_triple_barrier(
-        close=close_arr,
-        high=high_arr,
-        low=low_arr,
-        events=event_indices,
-        upper_barrier=ub,
-        lower_barrier=lb,
-        horizon=horizon,
-        side=sides,
-    )
+    # --- Step 3: Labeling ---
+    if method == "fixed_horizon":
+        if "atr_daily" not in df.columns:
+            raise ValueError("method='fixed_horizon' requires 'atr_daily' column. "
+                             "Run add_indicators() first.")
+        labels_df = fixed_horizon_label(
+            close=close_arr,
+            events=event_indices,
+            sides=sides,
+            daily_atr=df["atr_daily"].values,
+            horizon=horizon,
+        )
+        # Rename columns to match triple-barrier convention
+        labels_df["label"] = np.where(labels_df["y_norm"] > 0, 1,
+                               np.where(labels_df["y_norm"] < 0, -1, 0))
+        labels_df["barrier_hit"] = "fixed_horizon"
+        labels_df["n_bars_held"] = np.minimum(horizon, len(close_arr) - 1 - event_indices)
+        labels_df["actual_return"] = labels_df["raw_return"]
+        labels_df["return_atr"] = labels_df["y_norm"]
+        labels_df["truncated"] = (event_indices + horizon) >= len(close_arr)
+    else:
+        # ATR values for barrier_mode="atr"
+        atr_vals = None
+        if barrier_mode == "atr":
+            if "atr" not in df.columns:
+                raise ValueError("barrier_mode='atr' requires 'atr' column in raw_data. "
+                                 "Run add_indicators() first.")
+            atr_vals = df["atr"].values
+
+        labels_df = apply_triple_barrier(
+            close=close_arr,
+            high=high_arr,
+            low=low_arr,
+            events=event_indices,
+            upper_barrier=ub,
+            lower_barrier=lb,
+            horizon=horizon,
+            side=sides,
+            barrier_mode=barrier_mode,
+            atr_values=atr_vals,
+        )
 
     if verbose:
         vc = labels_df["label"].value_counts().to_dict()
@@ -352,7 +384,8 @@ def build_ml_dataset(
     # Reorder columns: metadata first, then features, then label
     meta_cols = ["event_time", "side", "entry_price",
                  "label", "barrier_hit", "exit_idx",
-                 "n_bars_held", "exit_price", "actual_return", "truncated"]
+                 "n_bars_held", "exit_price",
+                 "actual_return", "return_atr", "truncated"]
     feature_cols = [c for c in dataset.columns if c not in meta_cols]
     dataset = dataset[meta_cols + feature_cols]
 
