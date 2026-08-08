@@ -1,0 +1,58 @@
+# Live / Backtest Strategy Configuration
+# Phase 4-6: Sizer → Risk → StrategyWrapper → Feeder → Gateway
+#
+# Same config structure for backtest AND live — only execution.mode changes.
+
+strategy:
+  name: "turtle_vol_filter"
+  version: "1.0"
+
+execution:
+  mode: "backtest"           # "backtest" or "live"
+  symbol: "BTCUSDT"
+  signal_threshold: 0.0
+
+trigger:
+  type: "research.triggers.turtle_breakout.TurtleBreakoutTrigger"
+  params:
+    entry_period: 28800
+    atr_period: 28800
+    atr_mult: 4.0
+    intensity_threshold: 0.5
+
+features:
+  type: "research.features.CompositeFeature"
+  params:
+    features:
+      - type: "research.features.VolumeRatioFeature"
+        params: { vol_period: 20 }
+      - type: "research.features.BreakoutIntensityFeature"
+        params: { entry_period: 28800, atr_period: 28800 }
+      - type: "research.features.TrendFilterFeature"
+        params: { ma_period: 200 }
+
+model:
+  path: "research/outputs/turtle_vol_filter_model.json"
+  feature_list: "research/outputs/turtle_vol_filter_features.json"
+  threshold: 50.0
+
+position_sizer:
+  type: "execution.sizers.VolatilityTargetingSizer"
+  params:
+    risk_pct: 0.01           # Turtle: 1% risk per trade
+    max_leverage: 20.0
+    min_size: 0.001
+
+risk_manager:
+  type: "execution.risk_managers.MaxDrawdownRiskManager"
+  params:
+    max_dd_pct: 0.05         # Block entries if DD > 5%
+
+bracket:
+  trailing_exit_indicator: "donchian_low"
+  trailing_exit_period: 14400  # 10-day exit at 1m
+
+zmq:
+  host: "localhost"
+  sub_port: 5555
+  push_port: 5556

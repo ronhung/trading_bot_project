@@ -24,6 +24,8 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from research.features import add_indicators, default_feature_pipeline
+from core.position_sizer import BasePositionSizer
+from core.risk_manager import BaseRiskManager
 
 
 # ============================================================
@@ -58,6 +60,8 @@ def lightweight_backtest(
     verbose: bool = False,
     ml_model=None,
     ml_threshold: float = 0.0,
+    position_sizer: BasePositionSizer | None = None,
+    risk_manager: BaseRiskManager | None = None,
 ) -> dict:
     """
     Pure vectorized turtle-trend-following backtest.
@@ -176,14 +180,22 @@ def lightweight_backtest(
 
                 entry_price = c
                 stop_price = long_stop[i]
-                risk = abs(entry_price - stop_price)
-                if risk > 0 and capital > 0:
-                    size_risk = (capital * risk_pct) / risk
-                    # Cap at max leverage (Binance USD-M: 20x)
-                    size_leverage_cap = (capital * max_leverage) / entry_price
-                    size_new = math.floor(min(size_risk, size_leverage_cap) * 1000) / 1000.0
+                # Use ABC sizer if provided, else inline formula (backward compat)
+                if position_sizer is not None:
+                    size_new = position_sizer.calculate_size(
+                        signal_strength=atr_mult,
+                        current_atr=atr[i] if not np.isnan(atr[i]) and atr[i] > 0 else 1.0,
+                        account_equity=capital,
+                        entry_price=c,
+                    )
                 else:
-                    size_new = 0.0
+                    risk = abs(entry_price - stop_price)
+                    if risk > 0 and capital > 0:
+                        size_risk = (capital * risk_pct) / risk
+                        size_leverage_cap = (capital * max_leverage) / entry_price
+                        size_new = math.floor(min(size_risk, size_leverage_cap) * 1000) / 1000.0
+                    else:
+                        size_new = 0.0
                 # Skip entry if size rounds to zero (account too small for this risk)
                 if size_new <= 0.0:
                     continue
@@ -204,13 +216,22 @@ def lightweight_backtest(
 
                 entry_price = c
                 stop_price = short_stop[i]
-                risk = abs(entry_price - stop_price)
-                if risk > 0 and capital > 0:
-                    size_risk = (capital * risk_pct) / risk
-                    size_leverage_cap = (capital * max_leverage) / entry_price
-                    size_new = math.floor(min(size_risk, size_leverage_cap) * 1000) / 1000.0
+                # Use ABC sizer if provided, else inline formula (backward compat)
+                if position_sizer is not None:
+                    size_new = position_sizer.calculate_size(
+                        signal_strength=atr_mult,
+                        current_atr=atr[i] if not np.isnan(atr[i]) and atr[i] > 0 else 1.0,
+                        account_equity=capital,
+                        entry_price=c,
+                    )
                 else:
-                    size_new = 0.0
+                    risk = abs(entry_price - stop_price)
+                    if risk > 0 and capital > 0:
+                        size_risk = (capital * risk_pct) / risk
+                        size_leverage_cap = (capital * max_leverage) / entry_price
+                        size_new = math.floor(min(size_risk, size_leverage_cap) * 1000) / 1000.0
+                    else:
+                        size_new = 0.0
                 if size_new <= 0.0:
                     continue
                 position = -1

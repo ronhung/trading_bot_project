@@ -304,11 +304,16 @@ def _backtest_target(
     cash: float = 10000.0,
     risk_pct: float = 0.02,
     max_leverage: float = 20.0,
+    position_sizer=None,
+    risk_manager=None,
 ) -> dict:
     """
     Target function: runs lightweight_backtest and returns performance metrics.
 
     Suitable for run_parameter_sweep(target_func=_backtest_target, ...)
+
+    Accepts optional position_sizer and risk_manager ABC instances for
+    config-driven sweeps (Phase 3b parameter fine-tuning).
     """
     from research.backtest import lightweight_backtest
 
@@ -323,6 +328,8 @@ def _backtest_target(
         risk_pct=risk_pct,
         max_leverage=max_leverage,
         verbose=False,
+        position_sizer=position_sizer,
+        risk_manager=risk_manager,
     )
 
     return {

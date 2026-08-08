@@ -1,0 +1,26 @@
+# Python dependencies for the unified quant trading system
+# Install: pip install -r requirements.txt
+
+# Core data science
+pandas>=2.0
+numpy>=1.24
+
+# ML
+xgboost>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+
+# YAML config
+pyyaml>=6.0
+
+# ZMQ IPC (C++ engine communication)
+pyzmq>=25.0
+
+# Data download
+requests>=2.31
+
+# Visualization (backtest plots)
+matplotlib>=3.7
+
+# Parquet I/O (historical data)
+pyarrow>=14.0

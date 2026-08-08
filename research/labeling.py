@@ -462,6 +462,111 @@ def fixed_horizon_label(
 
 
 # ============================================================
+# 4. BaseLabeler wrapper classes (implementing core.labeler.BaseLabeler)
+# ============================================================
+
+import numpy as np
+import pandas as pd
+from typing import Union, Optional
+
+from core.labeler import BaseLabeler
+
+
+class TripleBarrierLabeler(BaseLabeler):
+    """
+    Triple-barrier labeler wrapping apply_triple_barrier().
+
+    Supports both percentage-based and ATR-based barrier modes.
+    """
+
+    def __init__(
+        self,
+        upper_barrier: float = 0.02,
+        lower_barrier: float = -0.01,
+        horizon: int = 288,
+        barrier_mode: str = "pct",
+        atr_mult: Optional[float] = None,
+    ):
+        """
+        Args:
+            upper_barrier: Take-profit return (decimal) or ATR multiplier.
+            lower_barrier: Stop-loss return (decimal, negative) or ATR multiplier.
+            horizon: Maximum holding period in bars.
+            barrier_mode: "pct" for percentage, "atr" for ATR-based barriers.
+            atr_mult: If barrier_mode="atr", the ATR column to use from data.
+        """
+        self.upper_barrier = upper_barrier
+        self.lower_barrier = lower_barrier
+        self.horizon = horizon
+        self.barrier_mode = barrier_mode
+
+    def compute_labels(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_indices = np.flatnonzero(event_mask.values)
+
+        if events.dtype == int and set(events.unique()) - {0} <= {-1, 1}:
+            sides = events[event_mask].values.astype(int)
+        else:
+            sides = np.ones(len(event_indices), dtype=int)
+
+        atr_vals = None
+        if self.barrier_mode == "atr":
+            atr_vals = data["atr"].values if "atr" in data.columns else None
+
+        return apply_triple_barrier(
+            close=data["close"].values,
+            high=data["high"].values,
+            low=data["low"].values,
+            events=event_indices,
+            upper_barrier=self.upper_barrier,
+            lower_barrier=self.lower_barrier,
+            horizon=self.horizon,
+            side=sides,
+            barrier_mode=self.barrier_mode,
+            atr_values=atr_vals,
+        )
+
+
+class FixedHorizonLabeler(BaseLabeler):
+    """
+    Fixed-horizon labeler wrapping fixed_horizon_label().
+
+    Computes y_norm = trade-side forward return / daily ATR at a fixed horizon.
+    Used by Phase 3 regression pipeline.
+    """
+
+    def __init__(self, horizon: int = 14400):
+        """
+        Args:
+            horizon: Forward bars to look (default 14400 = 10 days at 1m).
+        """
+        self.horizon = horizon
+
+    def compute_labels(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_indices = np.flatnonzero(event_mask.values)
+
+        if events.dtype == int and set(events.unique()) - {0} <= {-1, 1}:
+            sides = events[event_mask].values.astype(int)
+        else:
+            sides = np.ones(len(event_indices), dtype=int)
+
+        if "atr_daily" not in data.columns:
+            raise ValueError(
+                "FixedHorizonLabeler requires 'atr_daily' column. "
+                "Run add_indicators() first."
+            )
+
+        return fixed_horizon_label(
+            close=data["close"].values,
+            events=event_indices,
+            sides=sides,
+            daily_atr=data["atr_daily"].values,
+            horizon=self.horizon,
+        )
+
+
+# ============================================================
 # __main__ self-test
 # ============================================================
 if __name__ == "__main__":

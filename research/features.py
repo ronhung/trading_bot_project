@@ -291,6 +291,196 @@ def default_feature_pipeline() -> FeatureFunc:
 
 
 # ============================================================
+# 4. BaseFeature wrapper classes (implementing core.feature.BaseFeature)
+# ============================================================
+
+from core.feature import BaseFeature
+
+
+class _CallableFeature(BaseFeature):
+    """Adapter: wraps an existing FeatureFunc callable as a BaseFeature."""
+
+    def __init__(self, func: FeatureFunc, name: str = "callable_feature"):
+        self._func = func
+        self._name = name
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_indices = np.flatnonzero(event_mask.values)
+        rows = [self._func(data, int(idx)) for idx in event_indices]
+        if not rows:
+            return pd.DataFrame(index=pd.Index([], name="event_idx"))
+        return pd.DataFrame(rows, index=event_indices)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        return self._func(data, idx)
+
+    def __repr__(self) -> str:
+        return f"_CallableFeature({self._name})"
+
+
+class VolumeRatioFeature(BaseFeature):
+    """Volume surge detection: ratio of current volume to moving average."""
+
+    def __init__(self, vol_period: int = 20):
+        self.vol_period = vol_period
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        return _CallableFeature(
+            lambda df, idx: feature_volume_ratio(df, idx, self.vol_period),
+            "vol_ratio",
+        ).compute(data, events)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        return feature_volume_ratio(data, idx, self.vol_period)
+
+
+class BreakoutIntensityFeature(BaseFeature):
+    """Breakout strength normalized by ATR (matches turtle_math intensity)."""
+
+    def __init__(self, entry_period: int = 20, atr_period: int = 20):
+        self.entry_period = entry_period
+        self.atr_period = atr_period
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        return _CallableFeature(
+            lambda df, idx: feature_breakout_intensity(
+                df, idx, self.entry_period, self.atr_period,
+            ),
+            "breakout_intensity",
+        ).compute(data, events)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        return feature_breakout_intensity(data, idx, self.entry_period, self.atr_period)
+
+
+class ATRFeature(BaseFeature):
+    """ATR value and ATR as percentage of price."""
+
+    def __init__(self, period: int = 20):
+        self.period = period
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        return _CallableFeature(
+            lambda df, idx: feature_atr(df, idx, self.period), "atr",
+        ).compute(data, events)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        return feature_atr(data, idx, self.period)
+
+
+class ChannelPositionFeature(BaseFeature):
+    """Where price sits within the Donchian channel (0=bottom, 1=top)."""
+
+    def __init__(self, entry_period: int = 20):
+        self.entry_period = entry_period
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        return _CallableFeature(
+            lambda df, idx: feature_channel_position(df, idx, self.entry_period),
+            "channel_pos",
+        ).compute(data, events)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        return feature_channel_position(data, idx, self.entry_period)
+
+
+class DonchianWidthFeature(BaseFeature):
+    """Donchian channel width as percentage of price — volatility context."""
+
+    def __init__(self, entry_period: int = 20):
+        self.entry_period = entry_period
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        return _CallableFeature(
+            lambda df, idx: feature_donchian_width(df, idx, self.entry_period),
+            "channel_width",
+        ).compute(data, events)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        return feature_donchian_width(data, idx, self.entry_period)
+
+
+class LaggedReturnsFeature(BaseFeature):
+    """Returns over lookback periods at event time."""
+
+    def __init__(self, periods: Tuple[int, ...] = (5, 10, 30)):
+        self.periods = periods
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        return _CallableFeature(
+            lambda df, idx: feature_lagged_returns(df, idx, self.periods),
+            "lagged_returns",
+        ).compute(data, events)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        return feature_lagged_returns(data, idx, self.periods)
+
+
+class TakerFlowFeature(BaseFeature):
+    """Buy/sell pressure from taker volume ratio."""
+
+    def __init__(self, period: int = 20):
+        self.period = period
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        return _CallableFeature(
+            lambda df, idx: feature_taker_flow(df, idx, self.period),
+            "taker_flow",
+        ).compute(data, events)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        return feature_taker_flow(data, idx, self.period)
+
+
+class TrendFilterFeature(BaseFeature):
+    """200MA direction: +1 uptrend, -1 downtrend, and price-vs-MA ratio."""
+
+    def __init__(self, ma_period: int = 200):
+        self.ma_period = ma_period
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        return _CallableFeature(
+            lambda df, idx: feature_trend_filter(df, idx, self.ma_period),
+            "trend_filter",
+        ).compute(data, events)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        return feature_trend_filter(data, idx, self.ma_period)
+
+
+class CompositeFeature(BaseFeature):
+    """Combine multiple BaseFeature instances into one."""
+
+    def __init__(self, features: List[BaseFeature]):
+        self._features = features
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        results = [f.compute(data, events) for f in self._features]
+        return pd.concat(results, axis=1)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+        for f in self._features:
+            result.update(f.compute_one(data, idx))
+        return result
+
+
+def default_feature_set() -> CompositeFeature:
+    """Standard feature set as BaseFeature objects (used by pipeline_runner)."""
+    return CompositeFeature([
+        ATRFeature(),
+        BreakoutIntensityFeature(),
+        VolumeRatioFeature(),
+        ChannelPositionFeature(),
+        DonchianWidthFeature(),
+        LaggedReturnsFeature(),
+        TakerFlowFeature(),
+        TrendFilterFeature(),
+    ])
+
+
+# ============================================================
 # __main__ sanity check
 # ============================================================
 if __name__ == "__main__":
