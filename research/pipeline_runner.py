@@ -19,6 +19,7 @@ import sys
 import time
 from typing import Any, Dict
 
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -134,27 +135,56 @@ def run_evaluation(
 
     X_np, y_np, feature_names = evaluator.prepare_features(X)
 
-    # Time-series split
+    cv_folds = model_cfg.get("cv_folds", 1)
+    train_split = model_cfg.get("train_split", 0.8)
     n = len(X_np)
-    split_idx = int(n * 0.8)
-    X_train, y_train = X_np[:split_idx], y_np[:split_idx]
-    X_test, y_test = X_np[split_idx:], y_np[split_idx:]
 
-    print(f"\n  Train: {len(X_train):,} samples, Test: {len(X_test):,} samples")
+    # --- Purged time-series cross-validation ---
+    if cv_folds > 1:
+        # gap = label horizon so no label overlap leaks between folds
+        labeler_cfg = cfg.get("labeler", {})
+        gap = labeler_cfg.get("params", {}).get("horizon", 14400)
+        folds = evaluator.time_series_split(X_np, y_np, n_splits=cv_folds, gap=gap)
 
-    # Train
-    model = evaluator.train_model(X_train, y_train)
-    y_pred = model.predict(X_test)
+        print(f"\n  Purged Time-Series CV: {cv_folds} folds, gap={gap} bars")
+        ic_values = []
+        for i, (X_tr, X_val, y_tr, y_val) in enumerate(folds):
+            model = evaluator.train_model(X_tr, y_tr)
+            y_pred = model.predict(X_val)
+            ic = evaluator.evaluate_rank_ic(y_val, y_pred)["ic"]
+            ic_values.append(ic)
+            print(f"    Fold {i+1}: Train={len(X_tr):,}  Val={len(X_val):,}  IC={ic:.4f}")
 
-    # Evaluate
-    ic_result = evaluator.evaluate_rank_ic(y_test, y_pred)
-    decile_result = evaluator.evaluate_decile_spread(y_test, y_pred)
+        mean_ic = float(np.mean(ic_values))
+        std_ic = float(np.std(ic_values, ddof=1)) if len(ic_values) > 1 else 0.0
+        print(f"\n  Mean IC: {mean_ic:.4f} ± {std_ic:.4f}  "
+              f"[{'PASS' if abs(mean_ic) > evaluator.ic_threshold else 'FAIL'}]")
 
-    print(f"\n  Spearman Rank IC: {ic_result['ic']:.4f} (p={ic_result['p_value']:.4f})  "
-          f"[{'PASS' if ic_result['pass'] else 'FAIL'}]")
-    print(f"  Decile spread: {decile_result['spread']:+.4f}  "
-          f"monotonic={decile_result['monotonic']}  "
-          f"[{'PASS' if decile_result['spread'] > 0 and decile_result['monotonic'] else 'FAIL'}]")
+        # Train final model on all data for saving
+        model = evaluator.train_model(X_np, y_np)
+
+        ic_result = {"ic": mean_ic, "p_value": 0.0, "pass": abs(mean_ic) > evaluator.ic_threshold}
+        decile_result = {"spread": 0.0, "monotonic": False}
+
+    else:
+        # --- Single chronological split (no shuffle, preserves time order) ---
+        split_idx = int(n * train_split)
+        X_train, y_train = X_np[:split_idx], y_np[:split_idx]
+        X_test, y_test = X_np[split_idx:], y_np[split_idx:]
+
+        print(f"\n  Chronological split: Train={len(X_train):,}  Test={len(X_test):,}")
+
+        model = evaluator.train_model(X_train, y_train)
+        y_pred = model.predict(X_test)
+
+        ic_result = evaluator.evaluate_rank_ic(y_test, y_pred)
+        decile_result = evaluator.evaluate_decile_spread(y_test, y_pred)
+
+        print(f"\n  Spearman Rank IC: {ic_result['ic']:.4f} (p={ic_result['p_value']:.4f})  "
+              f"[{'PASS' if ic_result['pass'] else 'FAIL'}]")
+        print(f"  Decile spread: {decile_result['spread']:+.4f}  "
+              f"monotonic={decile_result['monotonic']}  "
+              f"[{'PASS' if decile_result['spread'] > 0 and decile_result['monotonic'] else 'FAIL'}]")
 
     # Save
     prefix = model_cfg.get("output_prefix", "xgb")
