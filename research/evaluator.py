@@ -215,7 +215,7 @@ class ModelEvaluator:
         return {
             "ic": float(ic),
             "p_value": float(pval),
-            "pass": abs(ic) > self.ic_threshold,
+            "pass": abs(ic) > self.ic_threshold and float(pval) < 0.05,
         }
 
     def evaluate_decile_spread(
