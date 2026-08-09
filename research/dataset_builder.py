@@ -25,6 +25,9 @@ if _PROJECT_ROOT not in sys.path:
 
 from research.labeling import apply_triple_barrier, fixed_horizon_label
 from research.features import add_indicators, make_feature_pipeline, FeatureFunc
+from core.trigger import BaseEventTrigger
+from core.feature import BaseFeature
+from core.labeler import BaseLabeler
 
 
 # ============================================================
@@ -217,9 +220,9 @@ def turtle_breakout_trigger(
 
 def build_ml_dataset(
     raw_data: pd.DataFrame,
-    event_trigger: Callable[[pd.DataFrame], pd.Series],
-    feature_pipeline: FeatureFunc,
-    labeling_config: dict,
+    event_trigger,  # BaseEventTrigger | Callable
+    feature_pipeline,  # BaseFeature | FeatureFunc
+    labeling_config,  # BaseLabeler | dict
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, dict]:
     """
@@ -228,7 +231,7 @@ def build_ml_dataset(
     Pipeline:
       1. Run event_trigger to find entry events
       2. For each event, compute features via feature_pipeline
-      3. Apply triple-barrier labeling to produce labels and returns
+      3. Apply labeling to produce labels and returns
       4. Assemble (X, y) DataFrame + metadata statistics
 
     Parameters
@@ -236,32 +239,28 @@ def build_ml_dataset(
     raw_data : pd.DataFrame
         OHLCV data. Required columns: open, high, low, close, volume.
         Must be sorted chronologically (oldest first).
-    event_trigger : callable
-        fn(df) -> pd.Series.
-        Returns boolean (True at events) or signed {-1, 0, 1} Series.
-        If boolean, all events are treated as long (side=1).
-    feature_pipeline : callable
-        fn(df, event_idx) -> {feature_name: value}.
-        Computes all features for one event at the given integer position.
-    labeling_config : dict
-        Triple-barrier parameters. Keys:
-          - upper_barrier: float (default 0.02, take-profit return as decimal)
-          - lower_barrier: float (default -0.01, stop-loss return)
-          - horizon: int (default 288, max holding bars)
-          - exit_price_mode: str (default "close")
+    event_trigger : BaseEventTrigger or callable
+        If BaseEventTrigger: calls .generate_signals(df).
+        If callable: fn(df) -> pd.Series (legacy path).
+    feature_pipeline : BaseFeature or FeatureFunc
+        If BaseFeature: calls .compute(df, events).
+        If FeatureFunc: fn(df, event_idx) -> {feature_name: value} (legacy).
+    labeling_config : BaseLabeler or dict
+        If BaseLabeler: calls .compute_labels(df, events).
+        If dict: triple-barrier params (legacy path).
     verbose : bool
         If True, print progress and summary statistics.
 
     Returns
     -------
     dataset : pd.DataFrame
-        One row per event. Columns include all feature columns plus:
-          event_time, side, entry_price, label, barrier_hit,
-          exit_idx, n_bars_held, exit_price, actual_return
     metadata : dict
-        Summary statistics: n_events, label_counts, label_rates,
-        barrier_hit_counts, mean_actual_return, etc.
     """
+    # --- Detect ABCs vs legacy callables ---
+    _use_abc_trigger = isinstance(event_trigger, BaseEventTrigger)
+    _use_abc_features = isinstance(feature_pipeline, BaseFeature)
+    _use_abc_labeler = isinstance(labeling_config, BaseLabeler)
+
     # --- Validate input ---
     required = {"open", "high", "low", "close"}
     missing = required - set(raw_data.columns)
@@ -270,15 +269,11 @@ def build_ml_dataset(
 
     df = raw_data.copy()
 
-    # --- Extract config with defaults ---
-    method = labeling_config.get("method", "triple_barrier")
-    ub = labeling_config.get("upper_barrier", 0.02)
-    lb = labeling_config.get("lower_barrier", -0.01)
-    horizon = labeling_config.get("horizon", 288)
-    barrier_mode = labeling_config.get("barrier_mode", "pct")
-
     # --- Step 1: Run event trigger ---
-    event_series = event_trigger(df)
+    if _use_abc_trigger:
+        event_series = event_trigger.generate_signals(df)
+    else:
+        event_series = event_trigger(df)
     event_series = event_series.reindex(df.index).fillna(0)
 
     # Detect if signed or boolean
@@ -306,69 +301,77 @@ def build_ml_dataset(
         empty_meta = {"n_events": 0, "error": "No events detected"}
         return empty_df, empty_meta
 
-    # --- Step 2: Compute features per event ---
-    feature_rows = []
-    entry_prices = []
-    event_times = []
-    for idx in event_indices:
-        features = feature_pipeline(df, idx)
-        feature_rows.append(features)
-        event_times.append(df.index[idx])
-        entry_prices.append(df["close"].iloc[idx])
+    # --- Step 2: Compute features ---
+    if _use_abc_features:
+        features_df = feature_pipeline.compute(df, event_series)
+    else:
+        feature_rows = []
+        for idx in event_indices:
+            feature_rows.append(feature_pipeline(df, idx))
+        features_df = pd.DataFrame(feature_rows, index=event_indices)
+        features_df.index.name = "event_idx"
 
-    features_df = pd.DataFrame(feature_rows, index=event_indices)
-    features_df.index.name = "event_idx"
+    entry_prices = df["close"].iloc[event_indices].tolist()
+    event_times = [df.index[idx] for idx in event_indices]
 
     if verbose:
         print(f"[build_ml_dataset] Computed {len(features_df.columns)} features "
               f"for {n_events} events")
 
-    # --- Step 3: Triple-barrier labeling ---
+    # --- Step 3: Labeling ---
     close_arr = df["close"].values
     high_arr = df["high"].values
     low_arr = df["low"].values
 
-    # --- Step 3: Labeling ---
-    if method == "fixed_horizon":
-        if "atr_daily" not in df.columns:
-            raise ValueError("method='fixed_horizon' requires 'atr_daily' column. "
-                             "Run add_indicators() first.")
-        labels_df = fixed_horizon_label(
-            close=close_arr,
-            events=event_indices,
-            sides=sides,
-            daily_atr=df["atr_daily"].values,
-            horizon=horizon,
-        )
-        # Rename columns to match triple-barrier convention
-        labels_df["label"] = np.where(labels_df["y_norm"] > 0, 1,
-                               np.where(labels_df["y_norm"] < 0, -1, 0))
-        labels_df["barrier_hit"] = "fixed_horizon"
-        labels_df["n_bars_held"] = np.minimum(horizon, len(close_arr) - 1 - event_indices)
-        labels_df["actual_return"] = labels_df["raw_return"]
-        labels_df["return_atr"] = labels_df["y_norm"]
-        labels_df["truncated"] = (event_indices + horizon) >= len(close_arr)
+    if _use_abc_labeler:
+        labels_df = labeling_config.compute_labels(df, event_series)
     else:
-        # ATR values for barrier_mode="atr"
-        atr_vals = None
-        if barrier_mode == "atr":
-            if "atr" not in df.columns:
-                raise ValueError("barrier_mode='atr' requires 'atr' column in raw_data. "
-                                 "Run add_indicators() first.")
-            atr_vals = df["atr"].values
+        method = labeling_config.get("method", "triple_barrier")
+        ub = labeling_config.get("upper_barrier", 0.02)
+        lb = labeling_config.get("lower_barrier", -0.01)
+        horizon = labeling_config.get("horizon", 288)
+        barrier_mode = labeling_config.get("barrier_mode", "pct")
 
-        labels_df = apply_triple_barrier(
-            close=close_arr,
-            high=high_arr,
-            low=low_arr,
-            events=event_indices,
-            upper_barrier=ub,
-            lower_barrier=lb,
-            horizon=horizon,
-            side=sides,
-            barrier_mode=barrier_mode,
-            atr_values=atr_vals,
-        )
+        if method == "fixed_horizon":
+            if "atr_daily" not in df.columns:
+                raise ValueError("method='fixed_horizon' requires 'atr_daily' column. "
+                                 "Run add_indicators() first.")
+            labels_df = fixed_horizon_label(
+                close=close_arr,
+                events=event_indices,
+                sides=sides,
+                daily_atr=df["atr_daily"].values,
+                horizon=horizon,
+            )
+            # Rename columns to match triple-barrier convention
+            labels_df["label"] = np.where(labels_df["y_norm"] > 0, 1,
+                                   np.where(labels_df["y_norm"] < 0, -1, 0))
+            labels_df["barrier_hit"] = "fixed_horizon"
+            labels_df["n_bars_held"] = np.minimum(horizon, len(close_arr) - 1 - event_indices)
+            labels_df["actual_return"] = labels_df["raw_return"]
+            labels_df["return_atr"] = labels_df["y_norm"]
+            labels_df["truncated"] = (event_indices + horizon) >= len(close_arr)
+        else:
+            # ATR values for barrier_mode="atr"
+            atr_vals = None
+            if barrier_mode == "atr":
+                if "atr" not in df.columns:
+                    raise ValueError("barrier_mode='atr' requires 'atr' column in raw_data. "
+                                     "Run add_indicators() first.")
+                atr_vals = df["atr"].values
+
+            labels_df = apply_triple_barrier(
+                close=close_arr,
+                high=high_arr,
+                low=low_arr,
+                events=event_indices,
+                upper_barrier=ub,
+                lower_barrier=lb,
+                horizon=horizon,
+                side=sides,
+                barrier_mode=barrier_mode,
+                atr_values=atr_vals,
+            )
 
     if verbose:
         vc = labels_df["label"].value_counts().to_dict()

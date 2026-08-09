@@ -31,3 +31,26 @@ class AllowAllRiskManager(BaseRiskManager):
 
     def check_risk_limits(self, current_portfolio_state: Dict[str, Any]) -> bool:
         return True
+
+
+class LivePositionGate(BaseRiskManager):
+    """
+    Advisory mirror of C++ RiskManager position gating.
+
+    Blocks entries when:
+      - A pending order already exists (has_pending_order)
+      - Already in a position (no pyramiding)
+      - Signal direction conflicts with current position
+    """
+
+    def check_risk_limits(self, current_portfolio_state: Dict[str, Any]) -> bool:
+        # Block if there's already a pending order
+        if current_portfolio_state.get("has_pending_order", False):
+            return False
+
+        # Block if already in a position (no pyramiding)
+        position = float(current_portfolio_state.get("current_position", 0.0))
+        if abs(position) > 1e-8:
+            return False
+
+        return True

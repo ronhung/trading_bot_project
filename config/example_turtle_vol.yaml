@@ -1,0 +1,93 @@
+# ================================================================
+# Example Strategy: 20-Day Turtle Breakout + Volume Filter + XGBoost
+# ================================================================
+# This config traces the user's example through all 6 phases:
+#
+# Phase 1: TurtleBreakoutTrigger — 20-day Donchian channel breakout
+# Phase 2: VolumeRatioFeature — vol/MA ratio with .shift(1) lookahead prevention
+#          FixedHorizonLabeler — 10-day forward return / daily ATR
+# Phase 3: XGBoost regressor — Spearman IC + decile staircase
+# Phase 3b: param_sweep + lightweight_backtest — fine-tune entry/exit/risk
+# Phase 4: VolatilityTargetingSizer — Turtle N-value (1% risk)
+#          MaxDrawdownRiskManager — block entries if DD > 5%
+# Phase 5: StrategyWrapper — loads turtle_vol_filter_model.json,
+#          C++ backtest_engine.exe replays CSV bars
+# Phase 6: Same components, mode: live, Binance WebSocket feed
+# ================================================================
+
+strategy:
+  name: "turtle_vol_filter"
+  version: "1.0"
+
+# --- Phase 1: Event Trigger ---
+trigger:
+  type: "research.triggers.turtle_breakout.TurtleBreakoutTrigger"
+  params:
+    entry_period: 28800      # 20-day at 1m bars
+    atr_period: 28800
+    atr_mult: 4.0
+    intensity_threshold: 0.5  # filter weak breakouts (< 0.5 ATR)
+    signed: true
+
+# --- Phase 2: Features ---
+features:
+  - type: "research.features.ATRFeature"
+    params: { period: 20 }
+  - type: "research.features.BreakoutIntensityFeature"
+    params: { entry_period: 28800, atr_period: 28800 }
+  - type: "research.features.VolumeRatioFeature"
+    params: { vol_period: 20 }
+  - type: "research.features.ChannelPositionFeature"
+    params: { entry_period: 28800 }
+  - type: "research.features.DonchianWidthFeature"
+    params: { entry_period: 28800 }
+  - type: "research.features.LaggedReturnsFeature"
+    params: { periods: [5, 10, 30] }
+  - type: "research.features.TakerFlowFeature"
+    params: { period: 20 }
+  - type: "research.features.TrendFilterFeature"
+    params: { ma_period: 200 }
+
+# --- Phase 2: Labeler ---
+labeler:
+  type: "research.labeling.FixedHorizonLabeler"
+  params:
+    horizon: 14400           # 10-day forward return at 1m
+
+# --- Phase 3: Model Training ---
+model:
+  type: "xgboost"
+  target: "y_norm"           # continuous: forward return / daily ATR
+  output_prefix: "turtle_vol_filter"
+  threshold: 0.0             # min predicted y_norm to fire (Phase 5/6)
+  params:
+    n_estimators: 400
+    max_depth: 5
+    learning_rate: 0.03
+    subsample: 0.8
+    colsample_bytree: 0.8
+    objective: "reg:squarederror"
+    random_state: 42
+
+# --- Phase 4: Position Sizing ---
+position_sizer:
+  type: "execution.sizers.VolatilityTargetingSizer"
+  params:
+    risk_pct: 0.01           # Turtle: 1% equity risk per trade
+    max_leverage: 20.0
+    min_size: 0.001
+
+# --- Phase 4: Risk Management ---
+risk_manager:
+  type: "execution.risk_managers.MaxDrawdownRiskManager"
+  params:
+    max_dd_pct: 0.05         # Block entries if drawdown > 5%
+
+# --- Phase 5-6: Execution ---
+execution:
+  mode: "backtest"            # "backtest" or "live"
+  symbol: "BTCUSDT"
+
+bracket:
+  trailing_exit_indicator: "donchian_low"
+  trailing_exit_period: 14400  # 10-day exit at 1m

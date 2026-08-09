@@ -1,14 +1,15 @@
 # Trading Bot Project — BTCUSDT Turtle Trend-Following System
 
-A hybrid **C++ / Python** automated trading system running a **Donchian Channel (Turtle Trading)** strategy on Binance USDT-M futures.
+A hybrid **C++ / Python** automated trading system built on a **unified 6-phase quant architecture** with ABC contracts, bracket-order execution, and configuration-driven assembly.
 
-Three execution modes, all sharing one strategy brain (`shared/core_logic/turtle_math.py`):
+Two execution modes share one strategy brain (`shared/core_logic/turtle_math.py`) and one ML pipeline (`research/` → `core/strategy_wrapper.py`):
 
 | Mode | Engine | When to use |
 |------|--------|-------------|
-| **Path A — Python Backtest** | Backtrader (`backtesting/run_backtest.py`) | Fast strategy prototyping & parameter sweeps |
-| **Path B — C++ Backtest** | `backtest_engine.exe` + the same live Python bot | Rehearse the exact live code path |
-| **Live Trading** | `live_engine.exe` + the same live Python bot | Paper/live on Binance Testnet |
+| **C++ Backtest** | `backtest_engine.exe` + Python `live_trend_bot.py` | Rehearse the exact live code path with friction costs |
+| **Live Trading** | `live_engine.exe` + Python `live_trend_bot.py` | Paper/live on Binance Testnet |
+
+> The Backtrader-based Path A has been removed. Use `research/backtest.py` (`lightweight_backtest()`) for fast vectorized prototyping (~50-200x faster) and `research/param_sweep.py` for parameter fine-tuning before committing to a C++ backtest.
 
 ### Strategy signals
 
@@ -28,22 +29,25 @@ Three execution modes, all sharing one strategy brain (`shared/core_logic/turtle
 
 ```bash
 # 1) Install Python deps + build C++
-pip install backtrader pandas numpy pyzmq requests matplotlib pyarrow
+pip install -r requirements.txt
 cd live_engine && mkdir build && cd build && cmake .. && cmake --build . --config Debug
 
 # 2) Download data (incremental; add --full-refresh for a full redownload)
 cd ../../data && python download_binance_data.py --prepare-csv
 
-# 3) Path A backtest
-cd ../backtesting && python run_backtest.py
+# 3) Research pipeline: build dataset → train model → evaluate
+cd ../research && python pipeline_runner.py ../config/example_turtle_vol.yaml
 
-# 4) Path B backtest — two terminals
+# 4) Parameter fine-tuning (sweep + fast backtest)
+python param_sweep.py
+
+# 5) C++ Backtest — two terminals
 #    T1:
 cd ../live_strategy && python live_trend_bot.py --no-warmup
 #    T2:
 cd ../live_engine/build/Debug && backtest_engine.exe
 
-# 5) Live (Testnet) — two terminals
+# 6) Live (Testnet) — two terminals
 #    T1:
 cd live_engine/build/Debug && live_engine.exe
 #    T2:
@@ -376,35 +380,109 @@ Behaviour:
 
 ---
 
-## 7. Directory Structure (key files)
+## 7. Directory Structure
 
 ```
-shared/config.json                     API keys, ZMQ ports, backtest params
-shared/core_logic/turtle_math.py       THE strategy brain (single source of truth)
-data/download_binance_data.py          kline/funding downloader + CSV export
-backtesting/run_backtest.py            Path A Backtrader backtest
-backtesting/plot_results.py            Visualize Path B trade CSV
-research/labeling.py                  triple-barrier labeler (vectorized + reference)
-research/features.py                  add_indicators() + feature pipeline
-research/dataset_builder.py           build_ml_dataset() + synthetic data
-research/backtest.py                  lightweight_backtest() — ~50-200x faster than Backtrader
-research/param_sweep.py               run_parameter_sweep() — multiprocessing grid search
-research/build_2024_dataset.py        one-shot 2024 ML pretrain dataset
-research/build_train_test_dataset.py  train (2020-2023) / test (2024) dataset builder
-research/ml_analysis.py               XGBoost regressor + Spearman IC + decile analysis
-live_engine/src/core/                  ipc_server, risk_manager, i_order_executor, thread_safe_queue
-live_engine/src/backtest/              main_backtest, mock_executor, data_replayer
-live_engine/src/live/                  main_live, binance_ws, binance_live_executor, order_tracker
-live_strategy/live_trend_bot.py        Python brain (live + C++ backtest)
-live_strategy/zmq_client.py            ZMQ SUB/PUSH client
+core/                                 ABC contracts (Phase 1-6 interfaces)
+  trigger.py                          BaseEventTrigger
+  feature.py                          BaseFeature
+  labeler.py                          BaseLabeler
+  position_sizer.py                   BasePositionSizer
+  risk_manager.py                     BaseRiskManager
+  order_payload.py                    OrderPayload (bracket order data contract)
+  strategy_wrapper.py                 StrategyWrapper (Phase 3→5/6 bridge)
+  data_feeder.py                      LiveDataFeeder ABC
+  execution_gateway.py                LiveExecutionGateway ABC
+execution/                            Concrete sizer + risk implementations
+  sizers.py                           VolatilityTargetingSizer
+  risk_managers.py                    MaxDrawdownRiskManager, LivePositionGate
+research/                             Research toolkit (implements core ABCs)
+  triggers/turtle_breakout.py         TurtleBreakoutTrigger(BaseEventTrigger)
+  labeling.py                         Triple-barrier + fixed-horizon labelers + ABC wrappers
+  features.py                         Indicator precompute + 8 feature classes (BaseFeature)
+  dataset_builder.py                  build_ml_dataset() — accepts ABCs + legacy callables
+  backtest.py                         lightweight_backtest() — vectorized, ~50-200x faster
+  param_sweep.py                      run_parameter_sweep() — multiprocessing grid search
+  evaluator.py                        ModelEvaluator (IC, decile, AUC-ROC, train/save)
+  pipeline_runner.py                  Config-driven DI runner (YAML → dataset → model)
+  outputs/                            X_*.parquet, xgb_model.json, meta_*.json
+live_strategy/                        Live trading (implements core ABCs)
+  zmq_client.py                       BinanceZmqClient (ZMQ SUB/PUSH, unchanged)
+  zmq_feeder.py                       BinanceZmqDataFeeder(LiveDataFeeder)
+  zmq_gateway.py                      BinanceZmqExecutionGateway(LiveExecutionGateway)
+  live_trend_bot.py                   Composition shell (feeder + StrategyWrapper + gateway)
+config/                               YAML strategy assembly
+  research_pipeline.yaml              Phase 1-3: trigger → features → labeler → model
+  live_strategy.yaml                  Phase 4-6: sizer → risk → execution → bracket
+  example_turtle_vol.yaml             Full 6-phase example config
+shared/
+  config.json                         API keys, ZMQ ports (C++ reads this)
+  core_logic/turtle_math.py           THE strategy brain — calculate_turtle_signals()
+live_engine/                          C++ engine (unchanged)
+  src/core/                           ipc_server, risk_manager, i_order_executor
+  src/backtest/                       main_backtest, mock_executor, data_replayer
+  src/live/                           main_live, binance_ws, binance_live_executor, order_tracker
+data/                                 Data pipeline
+  download_binance_data.py            kline/funding downloader + CSV export
+tests/                                Unit + parity tests
+requirements.txt                      Python dependencies
 ```
 
 ---
 
 ## 8. Dependencies
 
-**Python:** `backtrader`, `pandas`, `numpy`, `pyzmq`, `requests`, `matplotlib`, `pyarrow` / `fastparquet`.
+**Python:** `pandas`, `numpy`, `xgboost`, `scipy`, `scikit-learn`, `pyyaml`, `pyzmq`, `requests`, `matplotlib`, `pyarrow`.
+
+Install: `pip install -r requirements.txt`
 
 **C++:** nlohmann/json, IXWebSocket, libzmq + cppzmq, cpp-httplib, OpenSSL — fetched automatically by CMake.
 
-**System:** CMake ≥ 3.14, C++17 compiler, OpenSSL dev headers. Windows is the primary target; Linux/macOS work with minor path adjustments.
+**System:** CMake ≥ 3.14, C++17 compiler, OpenSSL dev headers. Windows is the primary target.
+
+---
+
+## 9. Unified Architecture (6 Phases)
+
+### Phase 1: Event Trigger
+`core/trigger.py::BaseEventTrigger` — abstract interface for event detection.
+`research/triggers/turtle_breakout.py::TurtleBreakoutTrigger` — 20-day Donchian breakout.
+
+### Phase 2: Features & Labeling
+`core/feature.py::BaseFeature` — feature computation with lookahead-bias prevention.
+`core/labeler.py::BaseLabeler` — supervised label computation (triple-barrier, fixed-horizon).
+Concrete implementations in `research/features.py`, `research/labeling.py`.
+
+### Phase 3: Signal Analysis & ML
+`research/evaluator.py::ModelEvaluator` — time-series CV, Spearman IC, decile staircase, AUC-ROC.
+`research/pipeline_runner.py` — config-driven DI runner (YAML → dataset → model).
+
+### Phase 3b: Parameter Fine-Tuning
+`research/param_sweep.py` — multiprocessing grid search.
+`research/backtest.py` — fast vectorized backtester (~50-200x faster than C++).
+Used together to fine-tune entry/exit/risk params before C++ backtest.
+
+### Phase 4: Portfolio & Risk
+`core/position_sizer.py::BasePositionSizer` — converts signal → contract size.
+`core/risk_manager.py::BaseRiskManager` — system-level risk gates.
+Concrete: `execution/sizers.py`, `execution/risk_managers.py`.
+
+### Phase 5: Robust Backtesting (Bracket Order Protocol)
+`core/strategy_wrapper.py::StrategyWrapper` — loads ML model, computes entry signals via
+`calculate_turtle_signals()`, assembles `OrderPayload` with bracket exit parameters.
+C++ engine replays historical CSV bars; `BinanceZmqDataFeeder` bridges ZMQ → StrategyWrapper.
+**Python NEVER polls for exits.** C++ manages the full bracket-order lifecycle.
+
+### Phase 6: Live Incubation
+Same `StrategyWrapper`, same sizer, same risk manager as Phase 5.
+`BinanceZmqDataFeeder` switches to Binance WebSocket (via C++ engine).
+`BinanceZmqExecutionGateway` switches to real REST API.
+Only config changes: `mode: backtest` → `mode: live`.
+
+### Bracket Order Protocol
+```
+Python (IDLE) → entry signal + ML → OrderPayload → C++ engine
+Python (WAITING_CLOSE) ← C++ manages stop-loss/trailing-exit/take-profit
+Python (IDLE) ← C++ sends POSITION_CLOSED
+```
+See `core/order_payload.py` for the data contract.

@@ -22,6 +22,7 @@ from core.trigger import BaseEventTrigger
 from core.feature import BaseFeature
 from core.position_sizer import BasePositionSizer
 from core.risk_manager import BaseRiskManager
+from shared.core_logic.turtle_math import calculate_turtle_signals
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +61,17 @@ class StrategyWrapper:
         symbol: str = "BTCUSDT",
         trailing_exit_indicator: TrailingExitIndicator = TrailingExitIndicator.DONCHIAN_LOW,
         trailing_exit_period: int = 14400,
+        entry_period: int = 20,
+        exit_period: int = 10,
+        atr_period: int = 20,
+        atr_mult: float = 2.0,
+        intensity_threshold: float = 0.0,
     ):
         """
         Args:
-            trigger: Event trigger for entry detection.
+            trigger: Event trigger for entry detection (research path).
             feature: Feature computer for ML input vector.
-            model: Trained ML model with .predict(X) method (or None for no ML filter).
+            model: Trained ML model with .predict(X) method.
             feature_names: Ordered list of feature names matching model input.
             sizer: Position size calculator.
             risk_manager: Risk gate (False = block all entries).
@@ -73,6 +79,10 @@ class StrategyWrapper:
             symbol: Trading pair.
             trailing_exit_indicator: Exit rule for C++ bracket order.
             trailing_exit_period: Lookback bars for trailing exit.
+            entry_period, exit_period, atr_period, atr_mult,
+            intensity_threshold: Passed to calculate_turtle_signals()
+                (shared/core_logic/turtle_math.py) — the single source
+                of truth for execution-path signal generation.
         """
         self._trigger = trigger
         self._feature = feature
@@ -84,6 +94,13 @@ class StrategyWrapper:
         self._symbol = symbol
         self._trailing_exit_indicator = trailing_exit_indicator
         self._trailing_exit_period = trailing_exit_period
+
+        # Turtle params for shared brain (execution path)
+        self._entry_period = entry_period
+        self._exit_period = exit_period
+        self._atr_period = atr_period
+        self._atr_mult = atr_mult
+        self._intensity_threshold = intensity_threshold
 
         self._state: StrategyState = StrategyState.IDLE
         self._kline_buffer: List[Dict[str, Any]] = []
@@ -122,20 +139,27 @@ class StrategyWrapper:
         self._kline_buffer.append(bar_data)
         df = pd.DataFrame(self._kline_buffer)
 
-        # --- Compute entry signal ---
-        signal_series = self._trigger.generate_signals(df)
-        signal = int(signal_series.iloc[-1])
+        # --- Compute entry signal via shared brain (single source of truth) ---
+        signal, stop_price = calculate_turtle_signals(
+            df,
+            self._entry_period,
+            self._exit_period,
+            self._atr_period,
+            self._atr_mult,
+            self._intensity_threshold,
+        )
 
-        if signal == 0:
+        if signal == 0 or stop_price is None:
             return None  # no event at this bar
 
-        # Determine action from signal
+        # Map turtle_math signal codes to Action
+        # 1=long entry, -1=short entry, 2=close long, -2=close short
         if signal == 1:
             action = Action.BUY
         elif signal == -1:
             action = Action.SELL
         else:
-            return None
+            return None  # exit signals (2, -2) not handled here — C++ manages exits
 
         # --- Compute features at current bar ---
         feat_dict = self._feature.compute_one(df, len(df) - 1)
@@ -173,11 +197,8 @@ class StrategyWrapper:
             return None
 
         # --- Compute bracket exit parameters ---
-        stop_distance = 2.0 * atr_val
-        if action == Action.BUY:
-            hard_stop = close - stop_distance
-        else:
-            hard_stop = close + stop_distance
+        # Use stop_price from calculate_turtle_signals() — the shared brain
+        hard_stop = stop_price
 
         # --- Assemble OrderPayload ---
         order = OrderPayload(
@@ -215,3 +236,87 @@ class StrategyWrapper:
         """Reset state and clear buffer (e.g., for backtest restart)."""
         self._state = StrategyState.IDLE
         self._kline_buffer.clear()
+
+    @classmethod
+    def from_yaml(cls, config_path: str) -> "StrategyWrapper":
+        """
+        Factory: instantiate StrategyWrapper from a YAML config file.
+
+        The config must contain: trigger, features, position_sizer,
+        risk_manager, model (optional), bracket, execution sections.
+
+        Uses the same component resolution as pipeline_runner.py
+        (importlib-based dynamic instantiation from type paths).
+        """
+        import importlib
+        import json
+
+        import yaml
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        def _instantiate(spec: dict):
+            type_path = spec["type"]
+            params = spec.get("params", {})
+            module_path, class_name = type_path.rsplit(".", 1)
+            module = importlib.import_module(module_path)
+            cls_ = getattr(module, class_name)
+            return cls_(**params)
+
+        # Trigger (research path; execution uses turtle_math directly)
+        trigger = _instantiate(cfg["trigger"])
+
+        # Features
+        feature_specs = cfg["features"]
+        if isinstance(feature_specs, list):
+            from research.features import CompositeFeature
+            feature = CompositeFeature([_instantiate(s) for s in feature_specs])
+        else:
+            feature = _instantiate(feature_specs)
+
+        # Sizer + risk
+        sizer = _instantiate(cfg["position_sizer"])
+        risk_manager = _instantiate(cfg["risk_manager"])
+
+        # Model (optional)
+        model = None
+        feature_names: list = []
+        model_cfg = cfg.get("model", {})
+        if model_cfg.get("path"):
+            import xgboost as xgb
+            model = xgb.XGBRegressor()
+            model.load_model(model_cfg["path"])
+            with open(model_cfg["feature_list"], "r") as f:
+                feature_names = json.load(f)
+
+        # Execution
+        exec_cfg = cfg.get("execution", {})
+        bracket_cfg = cfg.get("bracket", {})
+
+        trailing_map = {
+            "donchian_low": TrailingExitIndicator.DONCHIAN_LOW,
+            "donchian_high": TrailingExitIndicator.DONCHIAN_HIGH,
+            "moving_average": TrailingExitIndicator.MOVING_AVERAGE,
+        }
+
+        return cls(
+            trigger=trigger,
+            feature=feature,
+            model=model,
+            feature_names=feature_names,
+            sizer=sizer,
+            risk_manager=risk_manager,
+            signal_threshold=model_cfg.get("threshold", 0.0),
+            symbol=exec_cfg.get("symbol", "BTCUSDT"),
+            trailing_exit_indicator=trailing_map.get(
+                bracket_cfg.get("trailing_exit_indicator", "donchian_low"),
+                TrailingExitIndicator.DONCHIAN_LOW,
+            ),
+            trailing_exit_period=bracket_cfg.get("trailing_exit_period", 14400),
+            entry_period=cfg["trigger"]["params"].get("entry_period", 20),
+            exit_period=bracket_cfg.get("trailing_exit_period", 10),
+            atr_period=cfg["trigger"]["params"].get("atr_period", 20),
+            atr_mult=cfg["trigger"]["params"].get("atr_mult", 2.0),
+            intensity_threshold=cfg["trigger"]["params"].get("intensity_threshold", 0.0),
+        )
