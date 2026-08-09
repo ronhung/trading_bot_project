@@ -132,12 +132,16 @@ class ModelEvaluator:
                 f"Not enough data ({n}) for {n_splits} splits"
             )
 
+        # Cap gap to prevent eating all training data
         fold_size = n // (n_splits + 1)
+        max_gap = max(0, fold_size - 1)
+        gap = min(gap, max_gap)
+
         folds = []
         for i in range(n_splits):
             val_start = (i + 1) * fold_size
             val_end = val_start + fold_size
-            train_end = val_start - gap
+            train_end = max(fold_size, val_start - gap)
 
             folds.append((
                 X[:train_end], X[val_start:val_end],

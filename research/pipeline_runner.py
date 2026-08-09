@@ -141,12 +141,13 @@ def run_evaluation(
 
     # --- Purged time-series cross-validation ---
     if cv_folds > 1:
-        # gap = label horizon so no label overlap leaks between folds
-        labeler_cfg = cfg.get("labeler", {})
-        gap = labeler_cfg.get("params", {}).get("horizon", 14400)
+        # gap in event count: purge ~1 fold's worth of events between
+        # train and val so labels computed from overlapping bar windows
+        # don't leak across the split boundary
+        gap = max(1, n // (cv_folds * 4))
         folds = evaluator.time_series_split(X_np, y_np, n_splits=cv_folds, gap=gap)
 
-        print(f"\n  Purged Time-Series CV: {cv_folds} folds, gap={gap} bars")
+        print(f"\n  Purged Time-Series CV: {cv_folds} folds, gap={gap} events")
         ic_values = []
         for i, (X_tr, X_val, y_tr, y_val) in enumerate(folds):
             model = evaluator.train_model(X_tr, y_tr)
