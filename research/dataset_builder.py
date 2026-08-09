@@ -325,6 +325,22 @@ def build_ml_dataset(
 
     if _use_abc_labeler:
         labels_df = labeling_config.compute_labels(df, event_series)
+        # Normalize ABC labeler columns to match legacy convention
+        if "y_norm" in labels_df.columns and "label" not in labels_df.columns:
+            labels_df["label"] = np.where(labels_df["y_norm"] > 0, 1,
+                                   np.where(labels_df["y_norm"] < 0, -1, 0))
+        if "barrier_hit" not in labels_df.columns:
+            labels_df["barrier_hit"] = "fixed_horizon"
+        if "n_bars_held" not in labels_df.columns:
+            labels_df["n_bars_held"] = np.minimum(
+                14400, len(close_arr) - 1 - event_indices)
+        if "raw_return" in labels_df.columns and "actual_return" not in labels_df.columns:
+            labels_df["actual_return"] = labels_df["raw_return"]
+        if "y_norm" in labels_df.columns and "return_atr" not in labels_df.columns:
+            labels_df["return_atr"] = labels_df["y_norm"]
+        if "truncated" not in labels_df.columns:
+            horizon_val = getattr(labeling_config, 'horizon', 14400)
+            labels_df["truncated"] = (event_indices + horizon_val) >= len(close_arr)
     else:
         method = labeling_config.get("method", "triple_barrier")
         ub = labeling_config.get("upper_barrier", 0.02)
