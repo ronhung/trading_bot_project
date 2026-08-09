@@ -141,13 +141,21 @@ def run_evaluation(
 
     # --- Purged time-series cross-validation ---
     if cv_folds > 1:
-        # gap in event count: purge ~1 fold's worth of events between
-        # train and val so labels computed from overlapping bar windows
-        # don't leak across the split boundary
-        gap = max(1, n // (cv_folds * 4))
+        # Compute event-level gap from label horizon (bars) ÷ avg bars/event.
+        # Prevents label-window overlap across train/val boundary.
+        event_indices = X.index.values  # bar positions in original kline data
+        avg_bars_per_event = float(np.mean(np.diff(event_indices))) if len(event_indices) > 1 else 1.0
+
+        labeler_cfg = cfg.get("labeler", {})
+        label_horizon = labeler_cfg.get("params", {}).get("horizon", 14400)
+        gap = max(1, int(np.ceil(label_horizon / max(avg_bars_per_event, 1.0))))
+
         folds = evaluator.time_series_split(X_np, y_np, n_splits=cv_folds, gap=gap)
 
-        print(f"\n  Purged Time-Series CV: {cv_folds} folds, gap={gap} events")
+        print(f"\n  Purged Time-Series CV: {cv_folds} folds")
+        print(f"    avg bars/event={avg_bars_per_event:.0f}  "
+              f"label horizon={label_horizon} bars  "
+              f"→ event-level gap={gap}")
         ic_values = []
         for i, (X_tr, X_val, y_tr, y_val) in enumerate(folds):
             model = evaluator.train_model(X_tr, y_tr)
