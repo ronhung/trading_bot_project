@@ -61,8 +61,14 @@ def instantiate_features(feature_specs: list) -> Any:
     return CompositeFeature(instances)
 
 
-def load_data(cfg: Dict[str, Any]) -> pd.DataFrame:
-    """Load and filter data per config."""
+def load_data(cfg: Dict[str, Any], range_key: str = "date_range") -> pd.DataFrame:
+    """Load and filter data per config.
+
+    Args:
+        cfg: Full config dict.
+        range_key: Which data.<key> holds the [start, end] date filter
+            ("date_range", "train_range", or "test_range").
+    """
     data_cfg = cfg["data"]
     source = data_cfg["source"]
 
@@ -77,8 +83,8 @@ def load_data(cfg: Dict[str, Any]) -> pd.DataFrame:
         df["datetime"] = pd.to_datetime(df["datetime"])
 
     # Date range filter
-    if "date_range" in data_cfg:
-        start, end = data_cfg["date_range"]
+    if range_key in data_cfg:
+        start, end = data_cfg[range_key]
         if "datetime" in df.columns:
             mask = (df["datetime"] >= start) & (df["datetime"] < end)
             df = df.loc[mask].copy()
@@ -86,19 +92,64 @@ def load_data(cfg: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
+def compute_period_stats(X: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
+    """Per-year breakdown of a dataset (events, win rate, avg profit).
+
+    Args:
+        X: Dataset DataFrame whose index = event bar positions in `df`.
+        df: Original kline DataFrame (has a 'datetime' column).
+
+    Returns:
+        DataFrame with one row per year: events, win_rate, avg_y_norm,
+        median_y_norm, avg_raw_return.
+    """
+    if len(X) == 0 or "datetime" not in df.columns:
+        return pd.DataFrame()
+
+    event_positions = X.index.values
+    years = df["datetime"].iloc[event_positions].dt.year.values
+
+    stats = []
+    for year in sorted(np.unique(years)):
+        mask = years == year
+        sub = X.iloc[mask]
+        n = int(mask.sum())
+        row = {
+            "year": int(year),
+            "events": n,
+            "win_rate": float((sub["y_norm"] > 0).mean()) if n else 0.0,
+            "avg_y_norm": float(sub["y_norm"].mean()) if n else 0.0,
+            "median_y_norm": float(sub["y_norm"].median()) if n else 0.0,
+        }
+        if "raw_return" in sub.columns:
+            row["avg_raw_return"] = float(sub["raw_return"].mean()) if n else 0.0
+        stats.append(row)
+
+    return pd.DataFrame(stats)
+
+
 def build_dataset(
     df: pd.DataFrame,
     trigger: Any,
     features: Any,
     labeler: Any,
+    indicator_params: Dict[str, Any] = None,
     verbose: bool = True,
 ) -> tuple:
-    """Build ML dataset from assembled components."""
+    """Build ML dataset from assembled components.
+
+    Args:
+        indicator_params: dict of periods passed to add_indicators()
+            (e.g. entry_period, atr_period, vol_period, ma_period).
+            This is the single source of truth for indicator periods —
+            features are pure readers and never recompute them.
+    """
     from research.dataset_builder import build_ml_dataset
     from research.features import add_indicators
 
-    # Precompute indicators (required for lookahead-free features)
-    df = add_indicators(df)
+    # Precompute indicators with config-driven periods (required for
+    # lookahead-free features; periods must match the strategy).
+    df = add_indicators(df, **(indicator_params or {}))
 
     # Build event series from trigger
     events = trigger.generate_signals(df)
@@ -120,11 +171,21 @@ def build_dataset(
 
 
 def run_evaluation(
-    X: pd.DataFrame,
+    X_train: pd.DataFrame,
     cfg: Dict[str, Any],
     out_dir: str,
+    X_test: pd.DataFrame = None,
 ) -> Dict[str, Any]:
-    """Train model and evaluate."""
+    """Train model and evaluate.
+
+    Args:
+        X_train: Training dataset (index = event bar positions).
+        cfg: Full config dict.
+        out_dir: Output directory.
+        X_test: Optional out-of-sample test dataset. If provided, trains on
+            X_train and evaluates on X_test. Otherwise falls back to
+            CV / chronological split within X_train.
+    """
     from research.evaluator import ModelEvaluator
 
     model_cfg = cfg.get("model", {})
@@ -133,67 +194,83 @@ def run_evaluation(
         target=model_cfg.get("target", "y_norm"),
     )
 
-    X_np, y_np, feature_names = evaluator.prepare_features(X)
+    X_np, y_np, feature_names = evaluator.prepare_features(X_train)
 
-    cv_folds = model_cfg.get("cv_folds", 1)
-    train_split = model_cfg.get("train_split", 0.8)
-    n = len(X_np)
+    # --- Out-of-sample evaluation (explicit train/test datasets) ---
+    if X_test is not None:
+        X_test_np, y_test, _ = evaluator.prepare_features(X_test)
 
-    # --- Purged time-series cross-validation ---
-    if cv_folds > 1:
-        # Compute event-level gap from label horizon (bars) ÷ avg bars/event.
-        # Prevents label-window overlap across train/val boundary.
-        event_indices = X.index.values  # bar positions in original kline data
-        avg_bars_per_event = float(np.mean(np.diff(event_indices))) if len(event_indices) > 1 else 1.0
+        print(f"\n  Out-of-sample split: Train={len(X_np):,}  Test={len(X_test_np):,}")
 
-        labeler_cfg = cfg.get("labeler", {})
-        label_horizon = labeler_cfg.get("params", {}).get("horizon", 14400)
-        gap = max(1, int(np.ceil(label_horizon / max(avg_bars_per_event, 1.0))))
-
-        folds = evaluator.time_series_split(X_np, y_np, n_splits=cv_folds, gap=gap)
-
-        print(f"\n  Purged Time-Series CV: {cv_folds} folds")
-        print(f"    avg bars/event={avg_bars_per_event:.0f}  "
-              f"label horizon={label_horizon} bars  "
-              f"→ event-level gap={gap}")
-        ic_values = []
-        for i, (X_tr, X_val, y_tr, y_val) in enumerate(folds):
-            model = evaluator.train_model(X_tr, y_tr)
-            y_pred = model.predict(X_val)
-            ic = evaluator.evaluate_rank_ic(y_val, y_pred)["ic"]
-            ic_values.append(ic)
-            print(f"    Fold {i+1}: Train={len(X_tr):,}  Val={len(X_val):,}  IC={ic:.4f}")
-
-        mean_ic = float(np.mean(ic_values))
-        std_ic = float(np.std(ic_values, ddof=1)) if len(ic_values) > 1 else 0.0
-        print(f"\n  Mean IC: {mean_ic:.4f} ± {std_ic:.4f}  "
-              f"[{'PASS' if abs(mean_ic) > evaluator.ic_threshold else 'FAIL'}]")
-
-        # Train final model on all data for saving
         model = evaluator.train_model(X_np, y_np)
-
-        ic_result = {"ic": mean_ic, "p_value": 0.0, "pass": abs(mean_ic) > evaluator.ic_threshold}
-        decile_result = {"spread": 0.0, "monotonic": False}
-
-    else:
-        # --- Single chronological split (no shuffle, preserves time order) ---
-        split_idx = int(n * train_split)
-        X_train, y_train = X_np[:split_idx], y_np[:split_idx]
-        X_test, y_test = X_np[split_idx:], y_np[split_idx:]
-
-        print(f"\n  Chronological split: Train={len(X_train):,}  Test={len(X_test):,}")
-
-        model = evaluator.train_model(X_train, y_train)
-        y_pred = model.predict(X_test)
+        y_pred = model.predict(X_test_np)
 
         ic_result = evaluator.evaluate_rank_ic(y_test, y_pred)
         decile_result = evaluator.evaluate_decile_spread(y_test, y_pred)
 
-        print(f"\n  Spearman Rank IC: {ic_result['ic']:.4f} (p={ic_result['p_value']:.4f})  "
+        print(f"\n  Spearman Rank IC (test): {ic_result['ic']:.4f} (p={ic_result['p_value']:.4f})  "
               f"[{'PASS' if ic_result['pass'] else 'FAIL'}]")
-        print(f"  Decile spread: {decile_result['spread']:+.4f}  "
+        print(f"  Decile spread (test): {decile_result['spread']:+.4f}  "
               f"monotonic={decile_result['monotonic']}  "
               f"[{'PASS' if decile_result['spread'] > 0 and decile_result['monotonic'] else 'FAIL'}]")
+        if decile_result.get("quantile_means"):
+            print(f"    quantile means: {[f'{m:+.2f}' for m in decile_result['quantile_means']]}")
+
+    else:
+        cv_folds = model_cfg.get("cv_folds", 1)
+        train_split = model_cfg.get("train_split", 0.8)
+        n = len(X_np)
+
+        # --- Purged time-series cross-validation ---
+        if cv_folds > 1:
+            event_indices = X_train.index.values
+            avg_bars_per_event = float(np.mean(np.diff(event_indices))) if len(event_indices) > 1 else 1.0
+            labeler_cfg = cfg.get("labeler", {})
+            label_horizon = labeler_cfg.get("params", {}).get("horizon", 14400)
+            gap = max(1, int(np.ceil(label_horizon / max(avg_bars_per_event, 1.0))))
+
+            folds = evaluator.time_series_split(X_np, y_np, n_splits=cv_folds, gap=gap)
+
+            print(f"\n  Purged Time-Series CV: {cv_folds} folds")
+            print(f"    avg bars/event={avg_bars_per_event:.0f}  "
+                  f"label horizon={label_horizon} bars  "
+                  f"→ event-level gap={gap}")
+            ic_values = []
+            for i, (X_tr, X_val, y_tr, y_val) in enumerate(folds):
+                model = evaluator.train_model(X_tr, y_tr)
+                y_pred = model.predict(X_val)
+                ic = evaluator.evaluate_rank_ic(y_val, y_pred)["ic"]
+                ic_values.append(ic)
+                print(f"    Fold {i+1}: Train={len(X_tr):,}  Val={len(X_val):,}  IC={ic:.4f}")
+
+            mean_ic = float(np.mean(ic_values))
+            std_ic = float(np.std(ic_values, ddof=1)) if len(ic_values) > 1 else 0.0
+            print(f"\n  Mean IC: {mean_ic:.4f} ± {std_ic:.4f}  "
+                  f"[{'PASS' if abs(mean_ic) > evaluator.ic_threshold else 'FAIL'}]")
+
+            model = evaluator.train_model(X_np, y_np)
+            ic_result = {"ic": mean_ic, "p_value": 0.0, "pass": abs(mean_ic) > evaluator.ic_threshold}
+            decile_result = {"spread": 0.0, "monotonic": False}
+
+        else:
+            # --- Single chronological split ---
+            split_idx = int(n * train_split)
+            X_tr, y_tr = X_np[:split_idx], y_np[:split_idx]
+            X_te, y_te = X_np[split_idx:], y_np[split_idx:]
+
+            print(f"\n  Chronological split: Train={len(X_tr):,}  Test={len(X_te):,}")
+
+            model = evaluator.train_model(X_tr, y_tr)
+            y_pred = model.predict(X_te)
+
+            ic_result = evaluator.evaluate_rank_ic(y_te, y_pred)
+            decile_result = evaluator.evaluate_decile_spread(y_te, y_pred)
+
+            print(f"\n  Spearman Rank IC: {ic_result['ic']:.4f} (p={ic_result['p_value']:.4f})  "
+                  f"[{'PASS' if ic_result['pass'] else 'FAIL'}]")
+            print(f"  Decile spread: {decile_result['spread']:+.4f}  "
+                  f"monotonic={decile_result['monotonic']}  "
+                  f"[{'PASS' if decile_result['spread'] > 0 and decile_result['monotonic'] else 'FAIL'}]")
 
     # Save
     prefix = model_cfg.get("output_prefix", "xgb")
@@ -237,11 +314,12 @@ def main() -> int:
     t0 = time.perf_counter()
 
     # 1. Load data
-    print("\n[1/4] Loading data...")
-    df = load_data(cfg)
+    print("\n[1/5] Loading data...")
+    indicator_params = cfg.get("indicators", {})
+    data_cfg = cfg["data"]
 
     # 2. Instantiate components (DI — no hardcoded types)
-    print("[2/4] Assembling components from config...")
+    print("[2/5] Assembling components from config...")
     trigger = instantiate(cfg["trigger"])
     features = instantiate_features(cfg["features"])
     labeler = instantiate(cfg["labeler"])
@@ -250,24 +328,52 @@ def main() -> int:
     print(f"  Features: {type(features).__name__}")
     print(f"  Labeler : {type(labeler).__name__}")
 
-    # 3. Build dataset
-    print("[3/4] Building dataset...")
-    X, meta = build_dataset(df, trigger, features, labeler)
-    print(f"  Events: {meta['n_events']:,}")
-    print(f"  Features: {meta['feature_names']}")
-
-    # Save dataset
+    # 3. Build dataset(s)
+    print("[3/5] Building dataset...")
     os.makedirs(out_dir, exist_ok=True)
-    dataset_path = os.path.join(out_dir, f"X_{strategy_name}.parquet")
-    X.to_parquet(dataset_path, index=True)
-    print(f"  Dataset saved: {dataset_path}")
+
+    if "test_range" in data_cfg:
+        # --- Out-of-sample: explicit train/test date ranges ---
+        df_train = load_data(cfg, "train_range")
+        df_test = load_data(cfg, "test_range")
+
+        X_train, meta_tr = build_dataset(df_train, trigger, features, labeler, indicator_params)
+        X_test, meta_te = build_dataset(df_test, trigger, features, labeler, indicator_params)
+
+        print(f"  Train events: {meta_tr['n_events']:,}   Test events: {meta_te['n_events']:,}")
+        print(f"  Features: {meta_tr['feature_names']}")
+
+        X_train.to_parquet(os.path.join(out_dir, f"X_{strategy_name}_train.parquet"), index=True)
+        X_test.to_parquet(os.path.join(out_dir, f"X_{strategy_name}_test.parquet"), index=True)
+
+        # Per-year breakdown
+        print("\n  Per-year breakdown (y_norm = forward return / daily ATR):")
+        print(f"  {'Year':<6} {'Events':>8} {'WinRate':>9} {'Avg_y':>9} {'Med_y':>9} {'AvgRawRet':>11}")
+        print(f"  {'-'*6} {'-'*8} {'-'*9} {'-'*9} {'-'*9} {'-'*11}")
+        for _, row in compute_period_stats(X_train, df_train).iterrows():
+            print(f"  {row['year']:<6} {row['events']:>8} {row['win_rate']*100:>8.1f}% "
+                  f"{row['avg_y_norm']:>9.3f} {row['median_y_norm']:>9.3f} "
+                  f"{row.get('avg_raw_return', 0):>10.4f}")
+        for _, row in compute_period_stats(X_test, df_test).iterrows():
+            print(f"  {row['year']:<6} {row['events']:>8} {row['win_rate']*100:>8.1f}% "
+                  f"{row['avg_y_norm']:>9.3f} {row['median_y_norm']:>9.3f} "
+                  f"{row.get('avg_raw_return', 0):>10.4f}")
+
+    else:
+        # --- Single dataset (CV / chronological split) ---
+        df = load_data(cfg)
+        X_train, meta = build_dataset(df, trigger, features, labeler, indicator_params)
+        X_test = None
+        print(f"  Events: {meta['n_events']:,}")
+        print(f"  Features: {meta['feature_names']}")
+        X_train.to_parquet(os.path.join(out_dir, f"X_{strategy_name}.parquet"), index=True)
 
     # 4. Train + evaluate
     if "model" in cfg:
-        print("[4/4] Training + evaluating model...")
-        results = run_evaluation(X, cfg, out_dir)
+        print("\n[4/5] Training + evaluating model...")
+        results = run_evaluation(X_train, cfg, out_dir, X_test)
     else:
-        print("[4/4] No model config — skipping training.")
+        print("\n[4/5] No model config — skipping training.")
 
     elapsed = time.perf_counter() - t0
     print(f"\n{'=' * 64}")

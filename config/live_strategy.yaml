@@ -18,7 +18,7 @@ trigger:
     entry_period: 28800
     atr_period: 28800
     atr_mult: 4.0
-    intensity_threshold: 0.5
+    intensity_threshold: 1.0
 
 features:
   type: "research.features.CompositeFeature"

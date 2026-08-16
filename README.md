@@ -130,7 +130,7 @@ from research.triggers.turtle_breakout import TurtleBreakoutTrigger
 trigger = TurtleBreakoutTrigger(
     entry_period=28800,       # 20-day at 1m bars
     atr_period=28800,
-    intensity_threshold=0.5,  # require ≥ 0.5 ATR breakout
+    intensity_threshold=1.0,  # require ≥ 1.0 ATR breakout (Phase 3b best)
     signed=True,
 )
 signals = trigger.generate_signals(df)  # pd.Series: 1=long, -1=short, 0=none
@@ -156,10 +156,13 @@ from research.features import add_indicators, VolumeRatioFeature, default_featur
 from research.labeling import FixedHorizonLabeler
 
 # Step A: Precompute indicators (ALL .shift(1) — zero lookahead guarantee)
-df = add_indicators(raw_data, entry_period=28800, atr_period=28800, vol_period=20)
+# `add_indicators` is the SINGLE SOURCE OF TRUTH for indicator periods;
+# feature classes are pure readers and never recompute them.
+df = add_indicators(raw_data, entry_period=28800, atr_period=28800,
+                    vol_period=1440, ma_period=288000)
 
-# Step B: Feature computation
-vol = VolumeRatioFeature(vol_period=20)
+# Step B: Feature computation (no params — periods live in add_indicators)
+vol = VolumeRatioFeature()
 features_df = vol.compute(df, signals)           # batch: DataFrame
 feat_dict  = vol.compute_one(df, bar_index=150)  # live: dict
 
@@ -230,10 +233,21 @@ evaluator.save("research/outputs", prefix="turtle_vol_filter")
 
 | File | Role |
 |------|------|
+| `research/phase3b_sweep.py` | One-command sweep: train (2020-2023) → validate (2024) |
 | `research/param_sweep.py` | `run_parameter_sweep()` — multiprocessing grid search |
 | `research/backtest.py` | `lightweight_backtest()` — ~50-200x faster than C++ |
 | `execution/sizers.py` | `VolatilityTargetingSizer` — ABC sizer |
 | `execution/risk_managers.py` | `MaxDrawdownRiskManager` — ABC risk |
+
+**One-command sweep** (48 combos: entry 10/20/30/40-day × atr_mult 3/4/5/6 × intensity 0/0.5/1.0):
+```bash
+python research/phase3b_sweep.py
+# → Sweeps on TRAIN (2020-2023), validates top-5 on TEST (2024)
+```
+
+**Key finding:** `entry=28800` (20-day), `atr_mult=4.0`, `intensity=1.0` wins
+(train Sharpe 1.33 → test Sharpe 0.89). `intensity=1.0` beats the previous
+`0.5` — requiring ≥ 1×ATR breakout filters weak/fake breakouts.
 
 ```python
 from research.param_sweep import run_parameter_sweep

@@ -9,7 +9,9 @@ strategy:
 
 data:
   source: "data/historical_data/BTCUSDT_1m_full.parquet"
-  date_range: ["2020-01-01", "2024-01-01"]
+  # Out-of-sample split: train 2020-2023, test 2024 (no chronological overlap)
+  train_range: ["2020-01-01", "2024-01-01"]
+  test_range:  ["2024-01-01", "2025-01-01"]
 
 trigger:
   type: "research.triggers.turtle_breakout.TurtleBreakoutTrigger"
@@ -17,26 +19,28 @@ trigger:
     entry_period: 28800      # 20-day at 1m
     atr_period: 28800
     atr_mult: 4.0
-    intensity_threshold: 0.5
+    intensity_threshold: 1.0    # Phase 3b: 1.0 beats 0.5 (filters weak breakouts)
     signed: true
+
+# Single source of truth for indicator periods. Feature classes are pure
+# readers — they extract values from these precomputed columns, so ALL
+# lookback periods live here (and must match the trigger).
+indicators:
+  entry_period: 28800       # 20-day Donchian channel (match trigger)
+  exit_period: 14400        # 10-day exit channel
+  atr_period: 28800         # 20-day ATR (match trigger)
+  vol_period: 1440          # 1-day volume MA
+  ma_period: 288000         # 200-day trend MA
 
 features:
   - type: "research.features.ATRFeature"
-    params: { period: 20 }
   - type: "research.features.BreakoutIntensityFeature"
-    params: { entry_period: 28800, atr_period: 28800 }
   - type: "research.features.VolumeRatioFeature"
-    params: { vol_period: 20 }
   - type: "research.features.ChannelPositionFeature"
-    params: { entry_period: 28800 }
   - type: "research.features.DonchianWidthFeature"
-    params: { entry_period: 28800 }
   - type: "research.features.LaggedReturnsFeature"
-    params: { periods: [5, 10, 30] }
   - type: "research.features.TakerFlowFeature"
-    params: { period: 20 }
   - type: "research.features.TrendFilterFeature"
-    params: { ma_period: 200 }
 
 labeler:
   type: "research.labeling.FixedHorizonLabeler"

@@ -30,6 +30,7 @@ def add_indicators(
     exit_period: int = 10,
     atr_period: int = 20,
     vol_period: int = 20,
+    ma_period: int = 200,
 ) -> pd.DataFrame:
     """
     Add rolling indicator columns to a COPY of the DataFrame.
@@ -37,24 +38,30 @@ def add_indicators(
     All indicators use .shift(1) — row `i` only uses data from bars <= `i`.
     Formulas exactly mirror shared/core_logic/turtle_math.py.
 
+    This is the SINGLE SOURCE OF TRUTH for indicator periods. Feature
+    callables/classes are pure readers — they never recompute indicators,
+    so all period parameters live here (driven by config, not hardcoded).
+
     Parameters
     ----------
     df : pd.DataFrame
         Must have columns: open, high, low, close, volume.
         Sorted chronologically (oldest first).
     entry_period, exit_period : int
-        Donchian channel lookback periods.
+        Donchian channel lookback periods (e.g. 28800 = 20 days at 1m).
     atr_period : int
         ATR smoothing period.
     vol_period : int
         Volume moving average period.
+    ma_period : int
+        Trend moving-average period (e.g. 288000 = 200 days at 1m).
 
     Returns
     -------
     pd.DataFrame with added columns:
       entry_high, entry_low, exit_high, exit_low,
-      atr, vol_ma, vol_ratio, channel_pos,
-      ret_5, ret_10, ret_30
+      atr, vol_ma, vol_ratio, vol_zscore, channel_pos,
+      ret_5, ret_10, ret_30, ma, atr_daily, taker_buy_ratio
     """
     out = df.copy()
 
@@ -72,9 +79,13 @@ def add_indicators(
     out["atr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1) \
                      .rolling(atr_period).mean().shift(1)
 
-    # --- Volume metrics ---
+    # --- Volume metrics (ratio + z-score, both shifted) ---
     out["vol_ma"] = out["volume"].rolling(vol_period).mean().shift(1)
     out["vol_ratio"] = out["volume"] / out["vol_ma"]
+    log_vol = np.log(out["volume"].replace(0, np.nan))
+    vol_mean = log_vol.rolling(vol_period).mean().shift(1)
+    vol_std = log_vol.rolling(vol_period).std(ddof=0).shift(1)
+    out["vol_zscore"] = (log_vol - vol_mean) / vol_std.replace(0, np.nan)
 
     # --- Channel position (where price sits within the Donchian band) ---
     channel_range = out["entry_high"] - out["entry_low"]
@@ -88,8 +99,8 @@ def add_indicators(
     for p in [5, 10, 30]:
         out[f"ret_{p}"] = out["close"] / out["close"].shift(p) - 1.0
 
-    # --- 200-period moving average (trend filter) ---
-    out["ma_200"] = out["close"].rolling(200).mean().shift(1)
+    # --- Trend moving average (configurable period) ---
+    out["ma"] = out["close"].rolling(ma_period).mean().shift(1)
 
     # --- Daily ATR as percentage of price (for volatility normalization) ---
     # atr is absolute ($); divide by close to get decimal; rolling 1440 smooths it
@@ -120,7 +131,7 @@ def _safe_loc(df: pd.DataFrame, idx: int, col: str, fallback: float = np.nan):
     return float(val)
 
 
-def feature_atr(df: pd.DataFrame, idx: int, period: int = 20) -> Dict[str, float]:
+def feature_atr(df: pd.DataFrame, idx: int) -> Dict[str, float]:
     """ATR value and ATR as percentage of price at event."""
     atr_val = _safe_loc(df, idx, "atr", 0.0)
     close = df["close"].iloc[idx]
@@ -128,23 +139,13 @@ def feature_atr(df: pd.DataFrame, idx: int, period: int = 20) -> Dict[str, float
     return {"atr": atr_val, "atr_pct": atr_pct}
 
 
-def feature_breakout_intensity(df: pd.DataFrame, idx: int,
-                                entry_period: int = 20,
-                                atr_period: int = 20) -> Dict[str, float]:
+def feature_breakout_intensity(df: pd.DataFrame, idx: int) -> Dict[str, float]:
     """Breakout strength normalized by ATR. Matches turtle_math intensity formula."""
     close = df["close"].iloc[idx]
-
-    # Fast path: use precomputed columns
     entry_high = _safe_loc(df, idx, "entry_high")
     entry_low = _safe_loc(df, idx, "entry_low")
-    atr_val = _safe_loc(df, idx, "atr")
-
-    # Fallback: compute on the fly from df slice
-    if pd.isna(entry_high) or pd.isna(entry_low):
-        sub = df.iloc[:idx + 1]
-        entry_high = sub["high"].rolling(entry_period).max().iloc[-1]
-        entry_low = sub["low"].rolling(entry_period).min().iloc[-1]
-    if pd.isna(atr_val) or atr_val <= 0:
+    atr_val = _safe_loc(df, idx, "atr", 1.0)
+    if atr_val <= 0:
         atr_val = 1.0  # turtle_math fallback
 
     long_intensity = (close - entry_high) / atr_val if pd.notna(entry_high) else 0.0
@@ -153,37 +154,19 @@ def feature_breakout_intensity(df: pd.DataFrame, idx: int,
     return {"long_intensity": float(long_intensity), "short_intensity": float(short_intensity)}
 
 
-def feature_volume_ratio(df: pd.DataFrame, idx: int,
-                          vol_period: int = 20) -> Dict[str, float]:
-    """Volume surge detection: ratio to moving average."""
+def feature_volume_ratio(df: pd.DataFrame, idx: int) -> Dict[str, float]:
+    """Volume surge detection: ratio to moving average + z-score."""
     vol_ratio = _safe_loc(df, idx, "vol_ratio", 1.0)
-
-    # Volume z-score over lookback (using log volume to handle skew)
-    if "volume" in df.columns and idx >= vol_period:
-        vol_hist = df["volume"].iloc[max(0, idx - vol_period + 1): idx + 1]
-        log_vol = np.log(vol_hist.replace(0, np.nan))
-        if len(log_vol.dropna()) >= 5:
-            mean_lv = log_vol.mean()
-            std_lv = log_vol.std()
-            current_lv = np.log(max(df["volume"].iloc[idx], 1e-12))
-            vol_zscore = (current_lv - mean_lv) / std_lv if std_lv > 0 else 0.0
-        else:
-            vol_zscore = 0.0
-    else:
-        vol_zscore = 0.0
-
+    vol_zscore = _safe_loc(df, idx, "vol_zscore", 0.0)
     return {"vol_ratio": vol_ratio, "vol_zscore": vol_zscore}
 
 
-def feature_channel_position(df: pd.DataFrame, idx: int,
-                              entry_period: int = 20) -> Dict[str, float]:
+def feature_channel_position(df: pd.DataFrame, idx: int) -> Dict[str, float]:
     """Where price sits within the Donchian channel (0=bottom, 1=top)."""
-    pos = _safe_loc(df, idx, "channel_pos", 0.5)
-    return {"channel_pos": pos}
+    return {"channel_pos": _safe_loc(df, idx, "channel_pos", 0.5)}
 
 
-def feature_donchian_width(df: pd.DataFrame, idx: int,
-                            entry_period: int = 20) -> Dict[str, float]:
+def feature_donchian_width(df: pd.DataFrame, idx: int) -> Dict[str, float]:
     """Donchian channel width as percentage of price — volatility context."""
     entry_high = _safe_loc(df, idx, "entry_high")
     entry_low = _safe_loc(df, idx, "entry_low")
@@ -197,28 +180,23 @@ def feature_donchian_width(df: pd.DataFrame, idx: int,
     return {"channel_width_pct": float(width_pct)}
 
 
-def feature_lagged_returns(df: pd.DataFrame, idx: int,
-                            periods: Tuple[int, ...] = (5, 10, 30)) -> Dict[str, float]:
+def feature_lagged_returns(df: pd.DataFrame, idx: int) -> Dict[str, float]:
     """Returns over lookback periods at event time."""
-    result = {}
-    for p in periods:
-        col = f"ret_{p}"
-        val = _safe_loc(df, idx, col, 0.0)
-        result[col] = val
-    return result
+    return {
+        "ret_5": _safe_loc(df, idx, "ret_5", 0.0),
+        "ret_10": _safe_loc(df, idx, "ret_10", 0.0),
+        "ret_30": _safe_loc(df, idx, "ret_30", 0.0),
+    }
 
 
-def feature_taker_flow(df: pd.DataFrame, idx: int,
-                        period: int = 20) -> Dict[str, float]:
+def feature_taker_flow(df: pd.DataFrame, idx: int) -> Dict[str, float]:
     """Buy/sell pressure from taker volume ratio."""
-    ratio = _safe_loc(df, idx, "taker_buy_ratio", 0.5)
-    return {"taker_buy_ratio": ratio}
+    return {"taker_buy_ratio": _safe_loc(df, idx, "taker_buy_ratio", 0.5)}
 
 
-def feature_trend_filter(df: pd.DataFrame, idx: int,
-                          ma_period: int = 200) -> Dict[str, float]:
-    """200MA direction: +1 uptrend, -1 downtrend, and price-vs-MA ratio."""
-    ma_val = _safe_loc(df, idx, "ma_200")
+def feature_trend_filter(df: pd.DataFrame, idx: int) -> Dict[str, float]:
+    """Trend MA direction: +1 uptrend, -1 downtrend, and price-vs-MA ratio."""
+    ma_val = _safe_loc(df, idx, "ma")
     close = df["close"].iloc[idx]
 
     if pd.isna(ma_val) or ma_val <= 0:
@@ -322,131 +300,81 @@ class _CallableFeature(BaseFeature):
 class VolumeRatioFeature(BaseFeature):
     """Volume surge detection: ratio of current volume to moving average."""
 
-    def __init__(self, vol_period: int = 20):
-        self.vol_period = vol_period
-
     def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        return _CallableFeature(
-            lambda df, idx: feature_volume_ratio(df, idx, self.vol_period),
-            "vol_ratio",
-        ).compute(data, events)
+        return _CallableFeature(feature_volume_ratio, "vol_ratio").compute(data, events)
 
     def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
-        return feature_volume_ratio(data, idx, self.vol_period)
+        return feature_volume_ratio(data, idx)
 
 
 class BreakoutIntensityFeature(BaseFeature):
     """Breakout strength normalized by ATR (matches turtle_math intensity)."""
 
-    def __init__(self, entry_period: int = 20, atr_period: int = 20):
-        self.entry_period = entry_period
-        self.atr_period = atr_period
-
     def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        return _CallableFeature(
-            lambda df, idx: feature_breakout_intensity(
-                df, idx, self.entry_period, self.atr_period,
-            ),
-            "breakout_intensity",
-        ).compute(data, events)
+        return _CallableFeature(feature_breakout_intensity, "breakout_intensity").compute(data, events)
 
     def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
-        return feature_breakout_intensity(data, idx, self.entry_period, self.atr_period)
+        return feature_breakout_intensity(data, idx)
 
 
 class ATRFeature(BaseFeature):
     """ATR value and ATR as percentage of price."""
 
-    def __init__(self, period: int = 20):
-        self.period = period
-
     def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        return _CallableFeature(
-            lambda df, idx: feature_atr(df, idx, self.period), "atr",
-        ).compute(data, events)
+        return _CallableFeature(feature_atr, "atr").compute(data, events)
 
     def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
-        return feature_atr(data, idx, self.period)
+        return feature_atr(data, idx)
 
 
 class ChannelPositionFeature(BaseFeature):
     """Where price sits within the Donchian channel (0=bottom, 1=top)."""
 
-    def __init__(self, entry_period: int = 20):
-        self.entry_period = entry_period
-
     def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        return _CallableFeature(
-            lambda df, idx: feature_channel_position(df, idx, self.entry_period),
-            "channel_pos",
-        ).compute(data, events)
+        return _CallableFeature(feature_channel_position, "channel_pos").compute(data, events)
 
     def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
-        return feature_channel_position(data, idx, self.entry_period)
+        return feature_channel_position(data, idx)
 
 
 class DonchianWidthFeature(BaseFeature):
     """Donchian channel width as percentage of price — volatility context."""
 
-    def __init__(self, entry_period: int = 20):
-        self.entry_period = entry_period
-
     def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        return _CallableFeature(
-            lambda df, idx: feature_donchian_width(df, idx, self.entry_period),
-            "channel_width",
-        ).compute(data, events)
+        return _CallableFeature(feature_donchian_width, "channel_width").compute(data, events)
 
     def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
-        return feature_donchian_width(data, idx, self.entry_period)
+        return feature_donchian_width(data, idx)
 
 
 class LaggedReturnsFeature(BaseFeature):
     """Returns over lookback periods at event time."""
 
-    def __init__(self, periods: Tuple[int, ...] = (5, 10, 30)):
-        self.periods = periods
-
     def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        return _CallableFeature(
-            lambda df, idx: feature_lagged_returns(df, idx, self.periods),
-            "lagged_returns",
-        ).compute(data, events)
+        return _CallableFeature(feature_lagged_returns, "lagged_returns").compute(data, events)
 
     def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
-        return feature_lagged_returns(data, idx, self.periods)
+        return feature_lagged_returns(data, idx)
 
 
 class TakerFlowFeature(BaseFeature):
     """Buy/sell pressure from taker volume ratio."""
 
-    def __init__(self, period: int = 20):
-        self.period = period
-
     def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        return _CallableFeature(
-            lambda df, idx: feature_taker_flow(df, idx, self.period),
-            "taker_flow",
-        ).compute(data, events)
+        return _CallableFeature(feature_taker_flow, "taker_flow").compute(data, events)
 
     def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
-        return feature_taker_flow(data, idx, self.period)
+        return feature_taker_flow(data, idx)
 
 
 class TrendFilterFeature(BaseFeature):
-    """200MA direction: +1 uptrend, -1 downtrend, and price-vs-MA ratio."""
-
-    def __init__(self, ma_period: int = 200):
-        self.ma_period = ma_period
+    """Trend MA direction: +1 uptrend, -1 downtrend, and price-vs-MA ratio."""
 
     def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        return _CallableFeature(
-            lambda df, idx: feature_trend_filter(df, idx, self.ma_period),
-            "trend_filter",
-        ).compute(data, events)
+        return _CallableFeature(feature_trend_filter, "trend_filter").compute(data, events)
 
     def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
-        return feature_trend_filter(data, idx, self.ma_period)
+        return feature_trend_filter(data, idx)
 
 
 class CompositeFeature(BaseFeature):
