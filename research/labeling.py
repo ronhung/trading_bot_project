@@ -671,6 +671,109 @@ class TurtleExitLabeler(BaseLabeler):
         return out
 
 
+class TrailingExitLabeler(BaseLabeler):
+    """
+    One-directional trailing-stop exit (Donchian trailing).
+
+    The position exits ONLY when price hits a stop that trails in the
+    favorable direction and never reverses:
+      long:  stop = running MAX of the N-bar low  (trails up, never down)
+      short: stop = running MIN of the N-bar high (trails down, never up)
+
+    Matches the live bracket config: trailing_exit_indicator="donchian_low",
+    trailing_exit_period=N. No take-profit and no time limit.
+    """
+
+    def __init__(self, trail_period: int = 14400):
+        self.trail_period = trail_period
+
+    def compute_labels(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_indices = np.flatnonzero(np.asarray(event_mask.values))
+        cols = ["label", "barrier_hit", "exit_idx", "n_bars_held",
+                "entry_price", "exit_price", "stop_distance", "actual_return"]
+        if len(event_indices) == 0:
+            return pd.DataFrame(columns=cols)
+
+        if events.dtype == int and set(events.unique()) - {0} <= {-1, 1}:
+            sides = np.asarray(events.values)[event_indices].astype(int)
+        else:
+            sides = np.ones(len(event_indices), dtype=int)
+
+        for req in ("exit_low", "exit_high"):
+            if req not in data.columns:
+                raise ValueError(
+                    f"TrailingExitLabeler requires '{req}'. Run add_indicators(exit_period=...) first."
+                )
+
+        close = data["close"].values
+        high = data["high"].values
+        low = data["low"].values
+        exit_low = data["exit_low"].values
+        exit_high = data["exit_high"].values
+        n = len(close)
+
+        exit_idx_list = []
+        exit_price_list = []
+        reason_list = []
+        n_bars_list = []
+        stop_distance_list = []
+
+        for ev, side in zip(event_indices, sides):
+            entry_price = close[ev]
+            if side == 1:  # long: trailing stop = running max of exit_low
+                stop_distance = entry_price - exit_low[ev]   # entry → initial stop
+                cummax = np.maximum.accumulate(exit_low[ev:])
+                stop_for_bar = cummax[:-1]          # stop at bar ev+k = cummax[k-1]
+                hit = low[ev + 1:] <= stop_for_bar
+            else:          # short: trailing stop = running min of exit_high
+                stop_distance = exit_high[ev] - entry_price
+                cummin = np.minimum.accumulate(exit_high[ev:])
+                stop_for_bar = cummin[:-1]
+                hit = high[ev + 1:] >= stop_for_bar
+            stop_distance_list.append(stop_distance)
+
+            if hit.any():
+                first = int(np.argmax(hit))
+                exit_idx = ev + 1 + first
+                stop = stop_for_bar[first]
+                exit_price = (min(close[exit_idx], stop) if side == 1
+                              else max(close[exit_idx], stop))
+                reason = "trailing_stop"
+            else:
+                exit_idx = n - 1
+                exit_price = close[n - 1]
+                reason = "still_open"
+
+            exit_idx_list.append(exit_idx)
+            exit_price_list.append(exit_price)
+            reason_list.append(reason)
+            n_bars_list.append(exit_idx - ev)
+
+        entry_prices = close[event_indices]
+        exit_prices = np.asarray(exit_price_list, dtype=float)
+        is_long = sides == 1
+        actual_return = np.where(
+            is_long,
+            np.log(exit_prices / entry_prices),
+            np.log(entry_prices / exit_prices),
+        )
+        label = np.where(actual_return > 0, 1, np.where(actual_return < 0, -1, 0))
+
+        out = pd.DataFrame({
+            "label": label,
+            "barrier_hit": np.asarray(reason_list, dtype=object),
+            "exit_idx": np.asarray(exit_idx_list, dtype=int),
+            "n_bars_held": np.asarray(n_bars_list, dtype=int),
+            "entry_price": entry_prices,
+            "exit_price": exit_prices,
+            "stop_distance": np.asarray(stop_distance_list, dtype=float),
+            "actual_return": actual_return,
+        }, index=event_indices)
+        out.index.name = "event_idx"
+        return out
+
+
 # ============================================================
 # __main__ self-test
 # ============================================================

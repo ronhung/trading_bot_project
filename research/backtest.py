@@ -62,6 +62,7 @@ def lightweight_backtest(
     max_leverage: float = 20.0,
     risk_pct: float = 0.02,
     stop_pct: float = 0.02,
+    loss_ratio: Optional[float] = None,   # fixed-risk sizing: risk this % of capital per x-bar range
     verbose: bool = False,
 ) -> dict:
     """
@@ -98,6 +99,8 @@ def lightweight_backtest(
     sides = sig_vals[event_idx].astype(int)
     n = len(ind)
     close = ind["close"].values
+    entry_high_arr = ind["entry_high"].values if "entry_high" in ind.columns else np.full(n, np.nan)
+    entry_low_arr = ind["entry_low"].values if "entry_low" in ind.columns else np.full(n, np.nan)
 
     # --- 3. Exits ---
     labels = exit_labeler.compute_labels(ind, events)
@@ -112,6 +115,7 @@ def lightweight_backtest(
     exit_price_arr = labels["exit_price"].values.astype(float)
     entry_price_arr = labels["entry_price"].values.astype(float)
     barrier_hit_arr = labels["barrier_hit"].values.astype(str)
+    stop_distance_arr = labels["stop_distance"].values.astype(float) if "stop_distance" in labels.columns else None
 
     # --- 4. ML filter setup ---
     _ml_feature_cols = ml_feature_cols  # explicit order, else auto-detect (sorted)
@@ -164,7 +168,19 @@ def lightweight_backtest(
                 continue
 
         # sizing
-        if position_sizer is not None:
+        if loss_ratio is not None:
+            # fixed-loss-ratio: risk `loss_ratio` of capital per the ACTUAL
+            # initial-stop distance (entry → trailing-stop start), if the
+            # labeler exposes it; else fall back to the x-bar range.
+            if stop_distance_arr is not None and stop_distance_arr[k] > 0:
+                risk_dist = stop_distance_arr[k]
+            else:
+                risk_dist = entry_high_arr[ei] - entry_low_arr[ei]
+            if risk_dist > 0 and capital > 0:
+                size = (capital * loss_ratio) / risk_dist
+            else:
+                size = 0.0
+        elif position_sizer is not None:
             size = position_sizer.calculate_size(
                 signal_strength=1.0,
                 current_atr=1.0,
