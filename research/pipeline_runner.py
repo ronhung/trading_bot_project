@@ -114,13 +114,15 @@ def compute_period_stats(X: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
         mask = years == year
         sub = X.iloc[mask]
         n = int(mask.sum())
-        row = {
-            "year": int(year),
-            "events": n,
-            "win_rate": float((sub["y_norm"] > 0).mean()) if n else 0.0,
-            "avg_y_norm": float(sub["y_norm"].mean()) if n else 0.0,
-            "median_y_norm": float(sub["y_norm"].median()) if n else 0.0,
-        }
+        row = {"year": int(year), "events": n}
+        if "label" in sub.columns:      # classification: hit take-profit
+            row["win_rate"] = float((sub["label"] == 1).mean()) if n else 0.0
+        if "y_norm" in sub.columns:     # regression
+            row["win_rate"] = float((sub["y_norm"] > 0).mean()) if n else 0.0
+            row["avg_y_norm"] = float(sub["y_norm"].mean()) if n else 0.0
+            row["median_y_norm"] = float(sub["y_norm"].median()) if n else 0.0
+        if "actual_return" in sub.columns:
+            row["avg_actual_return"] = float(sub["actual_return"].mean()) if n else 0.0
         if "raw_return" in sub.columns:
             row["avg_raw_return"] = float(sub["raw_return"].mean()) if n else 0.0
         stats.append(row)
@@ -189,32 +191,55 @@ def run_evaluation(
     from research.evaluator import ModelEvaluator
 
     model_cfg = cfg.get("model", {})
+    target = model_cfg.get("target", "y_norm")
+    is_clf = target == "label"
+
     evaluator = ModelEvaluator(
         model_params=model_cfg.get("params"),
-        target=model_cfg.get("target", "y_norm"),
+        target=target,
     )
 
+    def _binarize(y: np.ndarray) -> np.ndarray:
+        # TripleBarrier label: 1=take-profit, -1=stop-loss, 0=timeout.
+        return (y == 1.0).astype(np.float32)
+
+    def _fit_predict(X_tr, y_tr, X_va):
+        if is_clf:
+            model = evaluator.train_classifier(X_tr, y_tr)
+            return model, model.predict_proba(X_va)[:, 1]
+        model = evaluator.train_model(X_tr, y_tr)
+        return model, model.predict(X_va)
+
     X_np, y_np, feature_names = evaluator.prepare_features(X_train)
+    if is_clf:
+        y_np = _binarize(y_np)
 
     # --- Out-of-sample evaluation (explicit train/test datasets) ---
     if X_test is not None:
         X_test_np, y_test, _ = evaluator.prepare_features(X_test)
+        if is_clf:
+            y_test = _binarize(y_test)
 
         print(f"\n  Out-of-sample split: Train={len(X_np):,}  Test={len(X_test_np):,}")
 
-        model = evaluator.train_model(X_np, y_np)
-        y_pred = model.predict(X_test_np)
+        model, y_pred = _fit_predict(X_np, y_np, X_test_np)
 
-        ic_result = evaluator.evaluate_rank_ic(y_test, y_pred)
-        decile_result = evaluator.evaluate_decile_spread(y_test, y_pred)
-
-        print(f"\n  Spearman Rank IC (test): {ic_result['ic']:.4f} (p={ic_result['p_value']:.4f})  "
-              f"[{'PASS' if ic_result['pass'] else 'FAIL'}]")
-        print(f"  Decile spread (test): {decile_result['spread']:+.4f}  "
-              f"monotonic={decile_result['monotonic']}  "
-              f"[{'PASS' if decile_result['spread'] > 0 and decile_result['monotonic'] else 'FAIL'}]")
-        if decile_result.get("quantile_means"):
-            print(f"    quantile means: {[f'{m:+.2f}' for m in decile_result['quantile_means']]}")
+        if is_clf:
+            auc = evaluator.evaluate_auc_roc(y_test, y_pred)
+            print(f"\n  AUC-ROC (test): {auc['auc']:.4f}  "
+                  f"[{'PASS' if auc.get('pass') else 'FAIL'}]")
+            result = {"auc": auc}
+        else:
+            ic_result = evaluator.evaluate_rank_ic(y_test, y_pred)
+            decile_result = evaluator.evaluate_decile_spread(y_test, y_pred)
+            print(f"\n  Spearman Rank IC (test): {ic_result['ic']:.4f} (p={ic_result['p_value']:.4f})  "
+                  f"[{'PASS' if ic_result['pass'] else 'FAIL'}]")
+            print(f"  Decile spread (test): {decile_result['spread']:+.4f}  "
+                  f"monotonic={decile_result['monotonic']}  "
+                  f"[{'PASS' if decile_result['spread'] > 0 and decile_result['monotonic'] else 'FAIL'}]")
+            if decile_result.get("quantile_means"):
+                print(f"    quantile means: {[f'{m:+.2f}' for m in decile_result['quantile_means']]}")
+            result = {"ic": ic_result, "decile": decile_result}
 
     else:
         cv_folds = model_cfg.get("cv_folds", 1)
@@ -235,22 +260,28 @@ def run_evaluation(
             print(f"    avg bars/event={avg_bars_per_event:.0f}  "
                   f"label horizon={label_horizon} bars  "
                   f"→ event-level gap={gap}")
-            ic_values = []
+            scores = []
             for i, (X_tr, X_val, y_tr, y_val) in enumerate(folds):
-                model = evaluator.train_model(X_tr, y_tr)
-                y_pred = model.predict(X_val)
-                ic = evaluator.evaluate_rank_ic(y_val, y_pred)["ic"]
-                ic_values.append(ic)
-                print(f"    Fold {i+1}: Train={len(X_tr):,}  Val={len(X_val):,}  IC={ic:.4f}")
+                model, y_pred = _fit_predict(X_tr, y_tr, X_val)
+                s = (evaluator.evaluate_auc_roc(y_val, y_pred)["auc"] if is_clf
+                     else evaluator.evaluate_rank_ic(y_val, y_pred)["ic"])
+                scores.append(s)
+                print(f"    Fold {i+1}: Train={len(X_tr):,}  Val={len(X_val):,}  "
+                      f"{'AUC' if is_clf else 'IC'}={s:.4f}")
 
-            mean_ic = float(np.mean(ic_values))
-            std_ic = float(np.std(ic_values, ddof=1)) if len(ic_values) > 1 else 0.0
-            print(f"\n  Mean IC: {mean_ic:.4f} ± {std_ic:.4f}  "
-                  f"[{'PASS' if abs(mean_ic) > evaluator.ic_threshold else 'FAIL'}]")
+            mean_score = float(np.mean(scores))
+            std_score = float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0
+            if is_clf:
+                passed = mean_score > 0.55
+                print(f"\n  Mean AUC: {mean_score:.4f} ± {std_score:.4f}  [{'PASS' if passed else 'FAIL'}]")
+                result = {"auc": {"auc": mean_score, "pass": passed}}
+            else:
+                passed = abs(mean_score) > evaluator.ic_threshold
+                print(f"\n  Mean IC: {mean_score:.4f} ± {std_score:.4f}  [{'PASS' if passed else 'FAIL'}]")
+                result = {"ic": {"ic": mean_score, "p_value": 0.0, "pass": passed},
+                          "decile": {"spread": 0.0, "monotonic": False}}
 
-            model = evaluator.train_model(X_np, y_np)
-            ic_result = {"ic": mean_ic, "p_value": 0.0, "pass": abs(mean_ic) > evaluator.ic_threshold}
-            decile_result = {"spread": 0.0, "monotonic": False}
+            model = evaluator.train_classifier(X_np, y_np) if is_clf else evaluator.train_model(X_np, y_np)
 
         else:
             # --- Single chronological split ---
@@ -260,17 +291,21 @@ def run_evaluation(
 
             print(f"\n  Chronological split: Train={len(X_tr):,}  Test={len(X_te):,}")
 
-            model = evaluator.train_model(X_tr, y_tr)
-            y_pred = model.predict(X_te)
+            model, y_pred = _fit_predict(X_tr, y_tr, X_te)
 
-            ic_result = evaluator.evaluate_rank_ic(y_te, y_pred)
-            decile_result = evaluator.evaluate_decile_spread(y_te, y_pred)
-
-            print(f"\n  Spearman Rank IC: {ic_result['ic']:.4f} (p={ic_result['p_value']:.4f})  "
-                  f"[{'PASS' if ic_result['pass'] else 'FAIL'}]")
-            print(f"  Decile spread: {decile_result['spread']:+.4f}  "
-                  f"monotonic={decile_result['monotonic']}  "
-                  f"[{'PASS' if decile_result['spread'] > 0 and decile_result['monotonic'] else 'FAIL'}]")
+            if is_clf:
+                auc = evaluator.evaluate_auc_roc(y_te, y_pred)
+                print(f"\n  AUC-ROC: {auc['auc']:.4f}  [{'PASS' if auc.get('pass') else 'FAIL'}]")
+                result = {"auc": auc}
+            else:
+                ic_result = evaluator.evaluate_rank_ic(y_te, y_pred)
+                decile_result = evaluator.evaluate_decile_spread(y_te, y_pred)
+                print(f"\n  Spearman Rank IC: {ic_result['ic']:.4f} (p={ic_result['p_value']:.4f})  "
+                      f"[{'PASS' if ic_result['pass'] else 'FAIL'}]")
+                print(f"  Decile spread: {decile_result['spread']:+.4f}  "
+                      f"monotonic={decile_result['monotonic']}  "
+                      f"[{'PASS' if decile_result['spread'] > 0 and decile_result['monotonic'] else 'FAIL'}]")
+                result = {"ic": ic_result, "decile": decile_result}
 
     # Save
     prefix = model_cfg.get("output_prefix", "xgb")
@@ -278,8 +313,9 @@ def run_evaluation(
     print(f"\n  Model + features saved to {out_dir}/")
 
     return {
-        "ic": ic_result,
-        "decile": decile_result,
+        "ic": result.get("ic", {"ic": 0.0, "p_value": 1.0, "pass": False}),
+        "decile": result.get("decile", {"spread": 0.0, "monotonic": False}),
+        "auc": result.get("auc", {"auc": 0.5, "pass": False}),
         "feature_names": feature_names,
     }
 
@@ -347,17 +383,22 @@ def main() -> int:
         X_test.to_parquet(os.path.join(out_dir, f"X_{strategy_name}_test.parquet"), index=True)
 
         # Per-year breakdown
-        print("\n  Per-year breakdown (y_norm = forward return / daily ATR):")
-        print(f"  {'Year':<6} {'Events':>8} {'WinRate':>9} {'Avg_y':>9} {'Med_y':>9} {'AvgRawRet':>11}")
-        print(f"  {'-'*6} {'-'*8} {'-'*9} {'-'*9} {'-'*9} {'-'*11}")
+        is_clf = cfg.get("model", {}).get("target", "y_norm") == "label"
+        print("\n  Per-year breakdown:")
         for _, row in compute_period_stats(X_train, df_train).iterrows():
-            print(f"  {row['year']:<6} {row['events']:>8} {row['win_rate']*100:>8.1f}% "
-                  f"{row['avg_y_norm']:>9.3f} {row['median_y_norm']:>9.3f} "
-                  f"{row.get('avg_raw_return', 0):>10.4f}")
+            line = f"  {row['year']:<6} {row['events']:>8} {row['win_rate']*100:>8.1f}%"
+            if is_clf:
+                line += f"  AvgRet {row.get('avg_actual_return', 0):+.4f}"
+            else:
+                line += f"  Avg_y {row['avg_y_norm']:>9.3f}  Med_y {row['median_y_norm']:>9.3f}  AvgRawRet {row.get('avg_raw_return', 0):+.4f}"
+            print(line)
         for _, row in compute_period_stats(X_test, df_test).iterrows():
-            print(f"  {row['year']:<6} {row['events']:>8} {row['win_rate']*100:>8.1f}% "
-                  f"{row['avg_y_norm']:>9.3f} {row['median_y_norm']:>9.3f} "
-                  f"{row.get('avg_raw_return', 0):>10.4f}")
+            line = f"  {row['year']:<6} {row['events']:>8} {row['win_rate']*100:>8.1f}%"
+            if is_clf:
+                line += f"  AvgRet {row.get('avg_actual_return', 0):+.4f}"
+            else:
+                line += f"  Avg_y {row['avg_y_norm']:>9.3f}  Med_y {row['median_y_norm']:>9.3f}  AvgRawRet {row.get('avg_raw_return', 0):+.4f}"
+            print(line)
 
     else:
         # --- Single dataset (CV / chronological split) ---

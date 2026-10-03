@@ -1,0 +1,54 @@
+# ================================================================
+# Adam Breakout Strategy — Phase 1-3 research pipeline
+# ================================================================
+# Phase 1: AdamBreakoutTrigger — 30-day high/low breakout
+# Phase 2: 8 default features + TripleBarrierLabeler (classification)
+# Phase 3: XGBoost classifier — predict hit take-profit (label==1), AUC-ROC
+# ================================================================
+
+strategy:
+  name: "adam_breakout"
+  version: "1.0"
+
+data:
+  source: "data/historical_data/BTCUSDT_1m_full.parquet"
+  train_range: ["2020-01-01", "2024-01-01"]   # in-sample
+  test_range:  ["2024-01-01", "2026-10-03"]   # out-of-sample
+
+trigger:
+  type: "research.triggers.adam_breakout.AdamBreakoutTrigger"
+  params:
+    period: 43200      # 30-day breakout at 1m
+    signed: true
+
+indicators:
+  entry_period: 43200  # 30-day Donchian channel (match trigger)
+  exit_period: 21600   # 15-day exit channel
+  atr_period: 43200    # 30-day ATR
+  vol_period: 1440     # 1-day volume MA
+  ma_period: 288000    # 200-day trend MA
+
+features:
+  - type: "research.features.ATRFeature"
+  - type: "research.features.BreakoutIntensityFeature"
+  - type: "research.features.VolumeRatioFeature"
+  - type: "research.features.ChannelPositionFeature"
+  - type: "research.features.DonchianWidthFeature"
+  - type: "research.features.LaggedReturnsFeature"
+  - type: "research.features.TakerFlowFeature"
+  - type: "research.features.TrendFilterFeature"
+
+labeler:
+  type: "research.labeling.TripleBarrierLabeler"
+  params:
+    upper_barrier: 0.05     # take-profit +5%
+    lower_barrier: -0.02    # stop-loss -2%
+    horizon: 1440           # max 1 day (1m bars)
+    barrier_mode: "pct"
+
+model:
+  type: "xgboost"
+  target: "label"           # classification: predict hit take-profit (label==1)
+  output_prefix: "adam_breakout"
+  train_split: 0.8
+  cv_folds: 1
