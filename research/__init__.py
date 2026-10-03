@@ -36,9 +36,11 @@ from research.dataset_builder import (
     make_synthetic_ohlcv,
 )
 from research.backtest import lightweight_backtest
+from research.trigger_analysis import analyze_trigger
 from research.param_sweep import run_parameter_sweep, _backtest_target, _dataset_target
 from research.evaluator import ModelEvaluator
 from research.triggers.turtle_breakout import TurtleBreakoutTrigger
+from research.triggers.adam_breakout import AdamBreakoutTrigger
 
 __all__ = [
     # labeling
@@ -60,6 +62,8 @@ __all__ = [
     "make_synthetic_ohlcv",
     # backtest
     "lightweight_backtest",
+    # trigger analysis
+    "analyze_trigger",
     # param sweep
     "run_parameter_sweep",
     "_backtest_target",
@@ -68,4 +72,5 @@ __all__ = [
     "ModelEvaluator",
     # triggers
     "TurtleBreakoutTrigger",
+    "AdamBreakoutTrigger",
 ]

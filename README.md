@@ -46,6 +46,9 @@ cd ../research && python pipeline_runner.py ../config/example_turtle_vol.yaml
 #    T2: cd live_strategy && python live_trend_bot.py
 ```
 
+> 💻 **Windows shortcut:** `build.ps1` / `run_backtest.ps1` / `run_live.ps1` do the
+> build + two-terminal launch for you — see [§9 Convenience Scripts](#9-convenience-scripts).
+
 ---
 
 ## 2. Setup
@@ -137,6 +140,37 @@ signals = trigger.generate_signals(df)  # pd.Series: 1=long, -1=short, 0=none
 ```
 
 **Add a new trigger:** Subclass `BaseEventTrigger`, implement `generate_signals()`. Register in YAML. No core code changes.
+
+**Validate a trigger before labeling** (`research/trigger_analysis.py`): measure
+each event's forward outcome and compare it against a random-entry baseline of
+the same direction. The barrier you pick should mirror the strategy's eventual
+exit mechanism.
+
+```python
+from research.trigger_analysis import evaluate_trigger, analyze_trigger
+from research.labeling import FixedHorizonLabeler, TripleBarrierLabeler
+from research.triggers.adam_breakout import AdamBreakoutTrigger
+
+trigger = AdamBreakoutTrigger(period=43200)  # 30-day breakout at 1m
+
+# One barrier at a time
+evaluate_trigger(trigger, df, FixedHorizonLabeler(horizon=14400))
+evaluate_trigger(trigger, df,
+                 TripleBarrierLabeler(upper_barrier=0.05, lower_barrier=-0.02,
+                                      horizon=1440, barrier_mode="pct"))
+
+# Parameterized sweep — edit the grid, not the code
+analyze_trigger(trigger, df, mode="fixed_horizon",
+                horizons=(1440, 4320, 7200, 14400, 43200))
+analyze_trigger(trigger, df, mode="triple_barrier",
+                triple_grid=((0.02, -0.01, 1440), (0.05, -0.02, 1440)),
+                tb_mode="pct")
+```
+
+Both return per-side (`long` / `short`) stats plus `baseline_long` /
+`baseline_short` (random entries of the same direction). `mode` selects the
+barrier family; `horizons` / `triple_grid` are the only things to edit when
+your trading frequency changes.
 
 ---
 
@@ -465,3 +499,43 @@ python tests/test_parity.py              # ABC ↔ legacy parity
 python tests/test_order_payload.py       # OrderPayload dataclass
 python tests/test_strategy_wrapper.py    # StrategyWrapper state machine
 ```
+
+---
+
+## 9. Convenience Scripts
+
+Three PowerShell scripts in the repo root wrap the build + two-terminal flows
+so you don't have to hand-type the commands or manage the MSYS2/Python
+environment. They assume MSYS2 UCRT64 at `C:\msys64` (override via
+`$env:MSYS2_ROOT`).
+
+| Script | Purpose |
+|--------|---------|
+| `build.ps1` | Rebuild `live_engine.exe` + `backtest_engine.exe` (CMake + Ninja) and bundle runtime DLLs next to the exe. |
+| `run_backtest.ps1` | Phase 5 — launch the Python brain (`--no-warmup`) + `backtest_engine.exe` in two windows. |
+| `run_live.ps1` | Phase 6 — launch the Python brain + `live_engine.exe` in two windows (live on Binance Testnet). |
+
+```powershell
+cd <repo root>
+
+# Rebuild the C++ engines (first time, or after editing C++)
+.\build.ps1
+
+# Phase 5 backtest — the engine window prints the BACKTEST REPORT
+.\run_backtest.ps1
+
+# Phase 6 live (Testnet) — real paper orders
+.\run_live.ps1
+```
+
+Details baked into the scripts:
+
+- `build.ps1` configures with `-DZMQ_HAVE_IPC=OFF` — libzmq's IPC path needs
+  POSIX `<sys/socket.h>`, which MinGW lacks. It also prepends
+  `C:\msys64\ucrt64\bin` to `PATH` so the compiler finds its runtime DLLs.
+- The `run_*.ps1` scripts set `PYTHONUTF8=1` (emoji logs otherwise crash on
+  Chinese-locale Windows cp950), resolve the miniconda Python, and open each
+  process in a `cmd /k` window so the backtest report stays visible.
+- Scripts output engines to `live_engine/build_cmake/` (not `build/Debug/`).
+
+If PowerShell blocks `.ps1`, run `powershell -ExecutionPolicy Bypass -File build.ps1`.

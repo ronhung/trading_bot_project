@@ -15,6 +15,7 @@ from core.labeler import BaseLabeler
 from core.position_sizer import BasePositionSizer
 from core.risk_manager import BaseRiskManager
 from research.triggers.turtle_breakout import TurtleBreakoutTrigger
+from research.triggers.adam_breakout import AdamBreakoutTrigger
 from research.features import (
     add_indicators,
     feature_volume_ratio,
@@ -67,6 +68,12 @@ def test_trigger_is_abc():
     assert isinstance(trigger, BaseEventTrigger)
 
 
+def test_adam_trigger_is_abc():
+    """AdamBreakoutTrigger is a BaseEventTrigger."""
+    trigger = AdamBreakoutTrigger(period=20)
+    assert isinstance(trigger, BaseEventTrigger)
+
+
 def test_features_are_abc():
     """Feature classes are BaseFeature instances."""
     assert isinstance(VolumeRatioFeature(), BaseFeature)
@@ -97,9 +104,9 @@ def test_feature_parity_volume_ratio():
     df = add_indicators(df)
     idx = 150
 
-    feat_class = VolumeRatioFeature(vol_period=20)
+    feat_class = VolumeRatioFeature()
     result_class = feat_class.compute_one(df, idx)
-    result_func = feature_volume_ratio(df, idx, 20)
+    result_func = feature_volume_ratio(df, idx)
 
     for key in result_func:
         assert abs(result_class[key] - result_func[key]) < 1e-10, \
@@ -112,9 +119,9 @@ def test_feature_parity_breakout_intensity():
     df = add_indicators(df)
     idx = 150
 
-    feat_class = BreakoutIntensityFeature(entry_period=20, atr_period=20)
+    feat_class = BreakoutIntensityFeature()
     result_class = feat_class.compute_one(df, idx)
-    result_func = feature_breakout_intensity(df, idx, 20, 20)
+    result_func = feature_breakout_intensity(df, idx)
 
     for key in result_func:
         assert abs(result_class[key] - result_func[key]) < 1e-10, \
@@ -165,6 +172,7 @@ def test_risk_manager_max_drawdown():
 
 if __name__ == "__main__":
     test_trigger_is_abc()
+    test_adam_trigger_is_abc()
     test_features_are_abc()
     test_labelers_are_abc()
     test_sizer_is_abc()
