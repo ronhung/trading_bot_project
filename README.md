@@ -286,7 +286,8 @@ python research/phase3b_sweep.py
 ```python
 from research.param_sweep import run_parameter_sweep
 from research.backtest import lightweight_backtest
-from research.features import add_indicators
+from research.triggers.turtle_breakout import TurtleBreakoutTrigger
+from research.labeling import TurtleExitLabeler
 from execution.sizers import VolatilityTargetingSizer
 from execution.risk_managers import MaxDrawdownRiskManager
 
@@ -297,11 +298,18 @@ param_grid = {
 }
 
 def sweep_target(entry_period, atr_mult, risk_pct, raw_data):
-    df = add_indicators(raw_data, entry_period=entry_period, atr_period=entry_period)
+    trigger = TurtleBreakoutTrigger(
+        entry_period=entry_period, atr_period=entry_period, atr_mult=atr_mult, signed=True,
+    )
+    exit_labeler = TurtleExitLabeler(
+        exit_period=entry_period // 2, atr_period=entry_period, atr_mult=atr_mult,
+    )
     sizer = VolatilityTargetingSizer(risk_pct=risk_pct)
     risk = MaxDrawdownRiskManager(max_dd_pct=0.05)
     return lightweight_backtest(
-        df, entry_period=entry_period, atr_mult=atr_mult,
+        raw_data, trigger=trigger, exit_labeler=exit_labeler,
+        indicator_params={"entry_period": entry_period, "exit_period": entry_period // 2,
+                          "atr_period": entry_period},
         position_sizer=sizer, risk_manager=risk,
     )
 

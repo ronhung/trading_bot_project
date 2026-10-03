@@ -27,6 +27,8 @@ if _PROJECT_ROOT not in sys.path:
 
 from research.backtest import lightweight_backtest
 from research.param_sweep import run_parameter_sweep
+from research.triggers.turtle_breakout import TurtleBreakoutTrigger
+from research.labeling import TurtleExitLabeler
 
 
 # ============================================================
@@ -48,13 +50,19 @@ def _sweep_target(
     Returns Sharpe, MDD, and a risk-adjusted score that penalizes
     deep drawdowns (1 point of Sharpe ≈ 25% of MDD).
     """
+    trigger = TurtleBreakoutTrigger(
+        entry_period=entry_period, atr_period=entry_period,
+        atr_mult=atr_mult, intensity_threshold=intensity_threshold, signed=True,
+    )
+    exit_labeler = TurtleExitLabeler(
+        exit_period=entry_period // 2, atr_period=entry_period, atr_mult=atr_mult,
+    )
     result = lightweight_backtest(
         raw_data,
-        entry_period=entry_period,
-        exit_period=entry_period // 2,
-        atr_period=entry_period,
-        atr_mult=atr_mult,
-        intensity_threshold=intensity_threshold,
+        trigger=trigger,
+        exit_labeler=exit_labeler,
+        indicator_params={"entry_period": entry_period, "exit_period": entry_period // 2,
+                          "atr_period": entry_period},
         initial_capital=10000.0,
         max_leverage=20.0,
         verbose=False,
@@ -149,13 +157,17 @@ def main() -> int:
 
     validation = []
     for _, row in top5.iterrows():
+        ep = int(row["entry_period"])
+        am = float(row["atr_mult"])
+        it = float(row["intensity_threshold"])
+        trigger = TurtleBreakoutTrigger(entry_period=ep, atr_period=ep, atr_mult=am,
+                                        intensity_threshold=it, signed=True)
+        exit_labeler = TurtleExitLabeler(exit_period=ep // 2, atr_period=ep, atr_mult=am)
         r = lightweight_backtest(
             df_test,
-            entry_period=int(row["entry_period"]),
-            exit_period=int(row["entry_period"]) // 2,
-            atr_period=int(row["entry_period"]),
-            atr_mult=float(row["atr_mult"]),
-            intensity_threshold=float(row["intensity_threshold"]),
+            trigger=trigger,
+            exit_labeler=exit_labeler,
+            indicator_params={"entry_period": ep, "exit_period": ep // 2, "atr_period": ep},
             initial_capital=10000.0,
             max_leverage=20.0,
             verbose=False,

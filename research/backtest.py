@@ -2,8 +2,9 @@
 Vectorized Lightweight Backtester — pure pandas/numpy, ~50-200x faster than Backtrader.
 
 Design:
-  1. Signals computed once for ALL bars via vectorized pandas operations.
-  2. A tight state-machine loop simulates position tracking.
+  1. Pluggable: a BaseEventTrigger defines entries, a BaseLabeler defines exits.
+  2. A single event-driven engine simulates position tracking (non-overlapping,
+     one position at a time) and builds a mark-to-market equity curve.
   3. Metrics (Sharpe, drawdown, win rate) computed vectorized from the equity curve.
 
 Shares add_indicators() from research.features — the indicator formulas
@@ -17,7 +18,7 @@ import sys
 import math
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -43,299 +44,194 @@ def _get_features_at_bar(df, bar_idx, feature_cols, pipeline):
 
 
 # ============================================================
-# 1. Main backtest function
+# 1. Main backtest function (pluggable)
 # ============================================================
 
 def lightweight_backtest(
     df: pd.DataFrame,
-    entry_period: int = 20,
-    exit_period: int = 10,
-    atr_period: int = 20,
-    atr_mult: float = 2.0,
-    intensity_threshold: float = 0.0,
+    trigger,                          # BaseEventTrigger — entry signals (-1/0/1)
+    exit_labeler,                     # BaseLabeler — per-event exit (exit_idx/exit_price/barrier_hit)
+    indicator_params: Optional[Dict] = None,
+    ml_model=None,                    # optional entry filter (classifier or regressor)
+    ml_threshold: float = 0.0,
+    ml_feature_cols: Optional[list] = None,  # explicit feature order for the model
+    position_sizer: Optional[BasePositionSizer] = None,
+    risk_manager: Optional[BaseRiskManager] = None,
     initial_capital: float = 10000.0,
-    risk_pct: float = 0.02,
     commission: float = 0.0005,
     max_leverage: float = 20.0,
+    risk_pct: float = 0.02,
+    stop_pct: float = 0.02,
     verbose: bool = False,
-    ml_model=None,
-    ml_threshold: float = 0.0,
-    position_sizer: BasePositionSizer | None = None,
-    risk_manager: BaseRiskManager | None = None,
 ) -> dict:
     """
-    Pure vectorized turtle-trend-following backtest.
+    Pluggable event-driven backtest.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        OHLCV data with columns: open, high, low, close.
-        Sorted chronologically (oldest first).
-    entry_period, exit_period, atr_period : int
-        Strategy lookback parameters.
-    atr_mult : float
-        ATR multiplier for stop-loss distance.
-    intensity_threshold : float
-        Minimum breakout intensity to enter (0.0 = any breakout).
-    initial_capital : float
-        Starting capital in quote currency (USDT).
-    risk_pct : float
-        Fraction of capital risked per trade (0.02 = 2%).
-    commission : float
-        Fee per trade as fraction of notional (0.0005 = 5 bps).
-    verbose : bool
-        If True, prints trade log.
+    df : OHLCV DataFrame (open/high/low/close/volume), chronological (oldest first).
+    trigger : BaseEventTrigger — generates entry events (-1=short, 1=long, 0=flat).
+    exit_labeler : BaseLabeler — computes per-event exit (columns: exit_idx,
+        exit_price, entry_price, barrier_hit, n_bars_held).
+    indicator_params : dict passed to add_indicators() so the exit labeler (and
+        the optional ML filter) see the right columns. Must match what the ML
+        model was trained on when ml_model is used.
+    ml_model : optional model to filter entries. Classifiers are scored via
+        predict_proba()[:, 1]; regressors via predict().
+    ml_threshold : minimum score to enter; entries below are skipped.
+    position_sizer : BasePositionSizer, or None for inline risk-based sizing.
+    risk_manager : BaseRiskManager, or None.
+    initial_capital, commission, max_leverage, risk_pct, stop_pct : sizing/fee knobs.
 
     Returns
     -------
-    dict with keys:
-      sharpe, win_rate, total_return_pct, max_dd_pct,
-      n_trades, profit_factor, avg_trade_pnl, avg_bars_held,
-      final_capital, equity_curve, trades_df
+    dict with sharpe/win_rate/total_return_pct/max_dd_pct/n_trades/... plus
+    equity_curve, trades_df, final_capital.
     """
-    # --- Ensure indicators are computed ---
-    required_cols = {"entry_high", "entry_low", "exit_high", "exit_low", "atr"}
-    if not required_cols.issubset(df.columns):
-        df = add_indicators(df, entry_period=entry_period,
-                            exit_period=exit_period,
-                            atr_period=atr_period)
+    # --- 1. Indicators (for the exit labeler + optional ML filter) ---
+    ind = add_indicators(df, **(indicator_params or {}))
 
-    # --- ML filter setup ---
-    ml_feature_cols = []
+    # --- 2. Entry events ---
+    events = trigger.generate_signals(ind)
+    sig_vals = np.asarray(events.values)
+    event_idx = np.flatnonzero(sig_vals != 0)
+    sides = sig_vals[event_idx].astype(int)
+    n = len(ind)
+    close = ind["close"].values
+
+    # --- 3. Exits ---
+    labels = exit_labeler.compute_labels(ind, events)
+    if len(labels) == 0:
+        empty = _compute_metrics(np.array([initial_capital]), [], initial_capital, 0)
+        empty["equity_curve"] = np.array([initial_capital])
+        empty["trades_df"] = pd.DataFrame()
+        empty["final_capital"] = initial_capital
+        return empty
+
+    exit_idx_arr = labels["exit_idx"].values.astype(int)
+    exit_price_arr = labels["exit_price"].values.astype(float)
+    entry_price_arr = labels["entry_price"].values.astype(float)
+    barrier_hit_arr = labels["barrier_hit"].values.astype(str)
+
+    # --- 4. ML filter setup ---
+    _ml_feature_cols = ml_feature_cols  # explicit order, else auto-detect (sorted)
     ml_feature_pipeline = None
+    is_classifier = False
     if ml_model is not None:
         ml_feature_pipeline = default_feature_pipeline()
-        # Detect feature columns from the pipeline
-        sample = ml_feature_pipeline(df, max(entry_period, atr_period) + 2)
-        ml_feature_cols = sorted(sample.keys())
+        is_classifier = hasattr(ml_model, "predict_proba")
+        if _ml_feature_cols is None:
+            sample = ml_feature_pipeline(ind, min(200, n - 1))
+            _ml_feature_cols = sorted(sample.keys())
 
-    n = len(df)
-    close = df["close"].values
-    high = df["high"].values
-    low = df["low"].values
-    entry_high = df["entry_high"].values
-    entry_low = df["entry_low"].values
-    exit_high = df["exit_high"].values
-    exit_low = df["exit_low"].values
-    atr = df["atr"].values
-
-    # --- Step 1: Vectorized signal computation ---
-    # Mirrors turtle_math.py exactly
-    valid_atr = np.where((~np.isnan(atr)) & (atr > 0), atr, 1.0)
-
-    long_intensity = (close - entry_high) / valid_atr
-    short_intensity = (entry_low - close) / valid_atr
-
-    long_entry_mask = (close > entry_high) & (long_intensity > intensity_threshold)
-    short_entry_mask = (close < entry_low) & (short_intensity > intensity_threshold)
-    # Exit only where there's no entry (matches turtle_math.py elif priority)
-    exit_long_mask = (close < exit_low) & ~long_entry_mask & ~short_entry_mask
-    exit_short_mask = (close > exit_high) & ~long_entry_mask & ~short_entry_mask
-
-    # Combine into single signal array
-    # 0=hold, 1=long_entry, -1=short_entry, 2=exit_long, -2=exit_short
-    signals = np.zeros(n, dtype=int)
-    signals[long_entry_mask] = 1
-    signals[short_entry_mask] = -1
-    signals[exit_long_mask] = 2
-    signals[exit_short_mask] = -2
-
-    # Entry priority over exit when both trigger on same bar (only relevant when flat)
-    # Exit priority when in position already handled by state machine
-
-    # Pre-computed stop levels (vectorized)
-    long_stop = close - atr * atr_mult
-    short_stop = close + atr * atr_mult
-
-    # --- Step 2: State machine ---
-    warmup = max(entry_period, atr_period) + 1
-
-    position = 0       # 0=flat, 1=long, -1=short
-    entry_price = 0.0
-    stop_price = 0.0
-    size = 0.0
-    entry_bar = 0
+    # --- 5. Process events sequentially (non-overlapping) ---
     capital = initial_capital
-    equity = [capital]
+    trades = []
+    last_exit_idx = -1
 
-    trades: List[dict] = []
+    for k in range(len(event_idx)):
+        ei = int(event_idx[k])
+        side = int(sides[k])
+        if ei <= last_exit_idx:
+            continue  # overlapping entry — skip (one position at a time)
 
-    for i in range(warmup, n):
-        sig = signals[i]
-        c = close[i]
-        h = high[i]
-        l = low[i]
+        xidx = int(exit_idx_arr[k])
+        eprice = entry_price_arr[k]
+        xprice = exit_price_arr[k]
+        reason = barrier_hit_arr[k]
 
-        if position == 0:
-            if sig == 1:  # long entry
-                # ML filter: skip if model predicts below threshold
-                if ml_model is not None:
-                    feats = _get_features_at_bar(df, i, ml_feature_cols, ml_feature_pipeline)
-                    if feats is not None:
-                        pred = float(ml_model.predict(feats)[0])
-                        if pred <= ml_threshold:
-                            if verbose:
-                                print(f"[{df.index[i]}] ML FILTER: skip LONG, pred_y={pred:.2f} <= {ml_threshold}")
-                            continue
-
-                entry_price = c
-                stop_price = long_stop[i]
-                # Use ABC sizer if provided, else inline formula (backward compat)
-                if position_sizer is not None:
-                    size_new = position_sizer.calculate_size(
-                        signal_strength=atr_mult,
-                        current_atr=atr[i] if not np.isnan(atr[i]) and atr[i] > 0 else 1.0,
-                        account_equity=capital,
-                        entry_price=c,
-                    )
-                else:
-                    risk = abs(entry_price - stop_price)
-                    if risk > 0 and capital > 0:
-                        size_risk = (capital * risk_pct) / risk
-                        size_leverage_cap = (capital * max_leverage) / entry_price
-                        size_new = math.floor(min(size_risk, size_leverage_cap) * 1000) / 1000.0
-                    else:
-                        size_new = 0.0
-                # Skip entry if size rounds to zero (account too small for this risk)
-                if size_new <= 0.0:
-                    continue
-                position = 1
-                size = size_new
-                entry_bar = i
-
-            elif sig == -1:  # short entry
-                # ML filter: skip if model predicts below threshold
-                if ml_model is not None:
-                    feats = _get_features_at_bar(df, i, ml_feature_cols, ml_feature_pipeline)
-                    if feats is not None:
-                        pred = float(ml_model.predict(feats)[0])
-                        if pred <= ml_threshold:
-                            if verbose:
-                                print(f"[{df.index[i]}] ML FILTER: skip SHORT, pred_y={pred:.2f} <= {ml_threshold}")
-                            continue
-
-                entry_price = c
-                stop_price = short_stop[i]
-                # Use ABC sizer if provided, else inline formula (backward compat)
-                if position_sizer is not None:
-                    size_new = position_sizer.calculate_size(
-                        signal_strength=atr_mult,
-                        current_atr=atr[i] if not np.isnan(atr[i]) and atr[i] > 0 else 1.0,
-                        account_equity=capital,
-                        entry_price=c,
-                    )
-                else:
-                    risk = abs(entry_price - stop_price)
-                    if risk > 0 and capital > 0:
-                        size_risk = (capital * risk_pct) / risk
-                        size_leverage_cap = (capital * max_leverage) / entry_price
-                        size_new = math.floor(min(size_risk, size_leverage_cap) * 1000) / 1000.0
-                    else:
-                        size_new = 0.0
-                if size_new <= 0.0:
-                    continue
-                position = -1
-                size = size_new
-                entry_bar = i
-
-        elif position == 1:  # holding long
-            exit_flag = False
-            exit_price = c
-            reason = "signal"
-
-            # Check stop-loss first (intra-bar low touches stop)
-            if l <= stop_price:
-                exit_flag = True
-                exit_price = min(c, stop_price)  # conservative: take worse price
-                reason = "stop"
-            elif sig == 2:  # exit signal
-                exit_flag = True
-                exit_price = c
-                reason = "signal"
-
-            if exit_flag:
-                # PnL with commission on both sides
-                raw_pnl = (exit_price - entry_price) * size
-                fees = commission * (entry_price + exit_price) * size
-                pnl = raw_pnl - fees
-                capital += pnl
-
-                trades.append({
-                    "entry_time": df.index[entry_bar],
-                    "exit_time": df.index[i],
-                    "side": "long",
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "stop_price": stop_price,
-                    "size": size,
-                    "pnl": pnl,
-                    "pnl_pct": pnl / initial_capital * 100,
-                    "bars_held": i - entry_bar,
-                    "exit_reason": reason,
-                })
-
+        # ML filter
+        if ml_model is not None:
+            feats = _get_features_at_bar(ind, ei, _ml_feature_cols, ml_feature_pipeline)
+            if feats is None:
+                continue
+            if is_classifier:
+                score = float(ml_model.predict_proba(feats)[0][1])
+            else:
+                score = float(ml_model.predict(feats)[0])
+            if score <= ml_threshold:
                 if verbose:
-                    print(f"[{df.index[i]}] CLOSE LONG: entry={entry_price:.1f} "
-                          f"exit={exit_price:.1f} pnl={pnl:.2f} reason={reason}")
+                    print(f"[{ind.index[ei]}] ML FILTER skip {side}, "
+                          f"score={score:.3f} <= {ml_threshold}")
+                continue
 
-                position = 0
+        # risk manager
+        if risk_manager is not None:
+            drawdown = (capital - initial_capital) / initial_capital
+            if not risk_manager.check_risk_limits(
+                {"current_drawdown": min(drawdown, 0.0), "current_position": 0.0}
+            ):
+                continue
 
-        elif position == -1:  # holding short (symmetric)
-            exit_flag = False
-            exit_price = c
-            reason = "signal"
-
-            if h >= stop_price:
-                exit_flag = True
-                exit_price = max(c, stop_price)  # conservative: take worse price
-                reason = "stop"
-            elif sig == -2:  # exit short signal
-                exit_flag = True
-                exit_price = c
-                reason = "signal"
-
-            if exit_flag:
-                raw_pnl = (entry_price - exit_price) * size
-                fees = commission * (entry_price + exit_price) * size
-                pnl = raw_pnl - fees
-                capital += pnl
-
-                trades.append({
-                    "entry_time": df.index[entry_bar],
-                    "exit_time": df.index[i],
-                    "side": "short",
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "stop_price": stop_price,
-                    "size": size,
-                    "pnl": pnl,
-                    "pnl_pct": pnl / initial_capital * 100,
-                    "bars_held": i - entry_bar,
-                    "exit_reason": reason,
-                })
-
-                if verbose:
-                    print(f"[{df.index[i]}] CLOSE SHORT: entry={entry_price:.1f} "
-                          f"exit={exit_price:.1f} pnl={pnl:.2f} reason={reason}")
-
-                position = 0
-
-        # Update equity curve even when holding (mark-to-market)
-        if position == 1:
-            unrealized = (c - entry_price) * size
-        elif position == -1:
-            unrealized = (entry_price - c) * size
+        # sizing
+        if position_sizer is not None:
+            size = position_sizer.calculate_size(
+                signal_strength=1.0,
+                current_atr=1.0,
+                account_equity=capital,
+                entry_price=eprice,
+            )
         else:
-            unrealized = 0.0
+            risk = eprice * stop_pct
+            if risk > 0 and capital > 0:
+                size_risk = (capital * risk_pct) / risk
+                size_cap = (capital * max_leverage) / eprice
+                size = math.floor(min(size_risk, size_cap) * 1000) / 1000.0
+            else:
+                size = 0.0
+        if size <= 0.0:
+            continue
+
+        # PnL
+        raw_pnl = side * (xprice - eprice) * size
+        fees = commission * (eprice + xprice) * size
+        pnl = raw_pnl - fees
+
+        trades.append({
+            "entry_idx": ei,
+            "exit_idx": xidx,
+            "side": side,
+            "entry_price": eprice,
+            "exit_price": xprice,
+            "size": size,
+            "pnl": pnl,
+            "entry_time": ind.index[ei],
+            "exit_time": ind.index[xidx],
+            "bars_held": xidx - ei,
+            "exit_reason": reason,
+            "pnl_pct": pnl / initial_capital * 100.0,
+        })
+        last_exit_idx = xidx
+
+    # --- 6. Mark-to-market equity curve ---
+    capital = initial_capital
+    equity = []
+    open_trade = None
+    tptr = 0
+    for i in range(n):
+        if open_trade is not None and i >= open_trade["exit_idx"]:
+            capital += open_trade["pnl"]
+            open_trade = None
+        if open_trade is None and tptr < len(trades) and trades[tptr]["entry_idx"] == i:
+            open_trade = trades[tptr]
+            tptr += 1
+        unrealized = 0.0
+        if open_trade is not None:
+            unrealized = open_trade["side"] * (close[i] - open_trade["entry_price"]) * open_trade["size"]
         equity.append(capital + unrealized)
 
-    # --- Step 3: Compute metrics ---
     equity_arr = np.array(equity)
     trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(
-        columns=["entry_time", "exit_time", "side", "entry_price", "exit_price",
-                 "stop_price", "size", "pnl", "pnl_pct", "bars_held", "exit_reason"])
+        columns=["entry_idx", "exit_idx", "side", "entry_price", "exit_price", "size",
+                 "pnl", "entry_time", "exit_time", "bars_held", "exit_reason", "pnl_pct"])
 
-    metrics = _compute_metrics(equity_arr, trades, initial_capital, warmup)
+    # --- 7. Metrics ---
+    trades_metrics = [
+        {"pnl": t["pnl"], "bars_held": t["bars_held"],
+         "entry_price": t["entry_price"], "exit_price": t["exit_price"], "size": t["size"]}
+        for t in trades
+    ]
+    metrics = _compute_metrics(equity_arr, trades_metrics, initial_capital, warmup=20)
 
     metrics["equity_curve"] = equity_arr
     metrics["trades_df"] = trades_df
@@ -444,15 +340,17 @@ if __name__ == "__main__":
     parser.add_argument("--ml-filter", action="store_true",
                         help="Use trained XGBoost model to filter entries")
     parser.add_argument("--ml-threshold", type=float, default=0.0,
-                        help="Min predicted y_norm to enter (default: 0)")
+                        help="Min predicted score to enter (default: 0)")
     args = parser.parse_args()
+
+    from research.triggers.turtle_breakout import TurtleBreakoutTrigger
+    from research.labeling import TurtleExitLabeler
 
     print("=" * 60)
     print("Vectorized Lightweight Backtester")
     print("=" * 60)
 
     if args.real:
-        # Load real data
         parquet_path = os.path.join(
             _PROJECT_ROOT, "data", "historical_data", "BTCUSDT_1m_full.parquet"
         )
@@ -484,7 +382,14 @@ if __name__ == "__main__":
         ml_threshold = args.ml_threshold
         print(f"\n[ML] Loaded XGBoost model, threshold={ml_threshold}")
 
-    # Run backtest
+    trigger = TurtleBreakoutTrigger(
+        entry_period=args.entry, atr_period=args.atr_period,
+        atr_mult=args.atr_mult, intensity_threshold=0.0, signed=True,
+    )
+    exit_labeler = TurtleExitLabeler(
+        exit_period=args.exit, atr_period=args.atr_period, atr_mult=args.atr_mult,
+    )
+
     import time
     print(f"\n[2] Running backtest: entry={args.entry}, exit={args.exit}, "
           f"atr_period={args.atr_period}, atr_mult={args.atr_mult}, "
@@ -492,14 +397,14 @@ if __name__ == "__main__":
     t0 = time.perf_counter()
     result = lightweight_backtest(
         df,
-        entry_period=args.entry,
-        exit_period=args.exit,
-        atr_period=args.atr_period,
-        atr_mult=args.atr_mult,
-        initial_capital=args.capital,
-        risk_pct=args.risk_pct,
+        trigger=trigger,
+        exit_labeler=exit_labeler,
+        indicator_params={"entry_period": args.entry, "exit_period": args.exit,
+                          "atr_period": args.atr_period},
         ml_model=ml_model,
         ml_threshold=ml_threshold,
+        initial_capital=args.capital,
+        risk_pct=args.risk_pct,
     )
     elapsed = time.perf_counter() - t0
 
@@ -514,7 +419,6 @@ if __name__ == "__main__":
     print(f"    Avg Bars Held:   {result['avg_bars_held']}")
     print(f"    Final Capital:   ${result['final_capital']:.2f}")
 
-    # Trade log
     if len(result["trades_df"]) > 0:
         print(f"\n[4] Trade log (first 10 of {len(result['trades_df'])}):")
         pd.set_option("display.max_columns", 10)

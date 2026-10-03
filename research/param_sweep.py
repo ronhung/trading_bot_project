@@ -316,14 +316,20 @@ def _backtest_target(
     config-driven sweeps (Phase 3b parameter fine-tuning).
     """
     from research.backtest import lightweight_backtest
+    from research.triggers.turtle_breakout import TurtleBreakoutTrigger
+    from research.labeling import TurtleExitLabeler
 
+    trigger = TurtleBreakoutTrigger(
+        entry_period=entry_period, atr_period=atr_period,
+        atr_mult=atr_mult, intensity_threshold=intensity_threshold, signed=True,
+    )
+    exit_labeler = TurtleExitLabeler(exit_period=exit_period, atr_period=atr_period, atr_mult=atr_mult)
     result = lightweight_backtest(
         raw_data,
-        entry_period=entry_period,
-        exit_period=exit_period,
-        atr_period=atr_period,
-        atr_mult=atr_mult,
-        intensity_threshold=intensity_threshold,
+        trigger=trigger,
+        exit_labeler=exit_labeler,
+        indicator_params={"entry_period": entry_period, "exit_period": exit_period,
+                          "atr_period": atr_period},
         initial_capital=cash,
         risk_pct=risk_pct,
         max_leverage=max_leverage,

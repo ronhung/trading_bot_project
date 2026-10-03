@@ -566,6 +566,111 @@ class FixedHorizonLabeler(BaseLabeler):
         )
 
 
+class TurtleExitLabeler(BaseLabeler):
+    """
+    Turtle exit: ATR stop-loss + reverse Donchian channel exit.
+
+    For each entry event, scan forward until either:
+      - stop hit (low <= stop for long, high >= stop for short), or
+      - reverse channel exit (close < exit_low for long, close > exit_high for short).
+    Whichever comes first. If neither within the data, exit at the last bar (timeout).
+    """
+
+    def __init__(self, exit_period: int = 10, atr_period: int = 20, atr_mult: float = 2.0):
+        self.exit_period = exit_period
+        self.atr_period = atr_period
+        self.atr_mult = atr_mult
+
+    def compute_labels(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_indices = np.flatnonzero(np.asarray(event_mask.values))
+
+        cols = ["label", "barrier_hit", "exit_idx", "n_bars_held",
+                "entry_price", "exit_price", "actual_return"]
+        if len(event_indices) == 0:
+            return pd.DataFrame(columns=cols)
+
+        if events.dtype == int and set(events.unique()) - {0} <= {-1, 1}:
+            sides = np.asarray(events.values)[event_indices].astype(int)
+        else:
+            sides = np.ones(len(event_indices), dtype=int)
+
+        for req in ("exit_low", "exit_high", "atr"):
+            if req not in data.columns:
+                raise ValueError(
+                    f"TurtleExitLabeler requires '{req}' column. Run add_indicators() first."
+                )
+
+        close = data["close"].values
+        high = data["high"].values
+        low = data["low"].values
+        exit_low = data["exit_low"].values
+        exit_high = data["exit_high"].values
+        atr = data["atr"].values
+        n = len(close)
+
+        exit_idx_list = []
+        exit_price_list = []
+        barrier_hit_list = []
+        n_bars_list = []
+
+        for ev, side in zip(event_indices, sides):
+            entry_price = close[ev]
+            atr_val = atr[ev] if not np.isnan(atr[ev]) and atr[ev] > 0 else 1.0
+
+            if side == 1:  # long
+                stop = entry_price - self.atr_mult * atr_val
+                stop_hit = low[ev + 1:] <= stop
+                channel_hit = close[ev + 1:] < exit_low[ev + 1:]
+            else:  # short
+                stop = entry_price + self.atr_mult * atr_val
+                stop_hit = high[ev + 1:] >= stop
+                channel_hit = close[ev + 1:] > exit_high[ev + 1:]
+
+            hit = stop_hit | channel_hit
+            if not hit.any():
+                exit_idx = n - 1
+                exit_price = close[n - 1]
+                reason = "timeout"
+            else:
+                first = int(np.argmax(hit))
+                exit_idx = ev + 1 + first
+                if stop_hit[first]:
+                    exit_price = (min(close[exit_idx], stop) if side == 1
+                                  else max(close[exit_idx], stop))
+                    reason = "stop"
+                else:
+                    exit_price = close[exit_idx]
+                    reason = "signal"
+
+            exit_idx_list.append(exit_idx)
+            exit_price_list.append(exit_price)
+            barrier_hit_list.append(reason)
+            n_bars_list.append(exit_idx - ev)
+
+        entry_prices = close[event_indices]
+        exit_prices = np.asarray(exit_price_list, dtype=float)
+        is_long = sides == 1
+        actual_return = np.where(
+            is_long,
+            np.log(exit_prices / entry_prices),
+            np.log(entry_prices / exit_prices),
+        )
+        label = np.where(actual_return > 0, 1, np.where(actual_return < 0, -1, 0))
+
+        out = pd.DataFrame({
+            "label": label,
+            "barrier_hit": np.asarray(barrier_hit_list, dtype=object),
+            "exit_idx": np.asarray(exit_idx_list, dtype=int),
+            "n_bars_held": np.asarray(n_bars_list, dtype=int),
+            "entry_price": entry_prices,
+            "exit_price": exit_prices,
+            "actual_return": actual_return,
+        }, index=event_indices)
+        out.index.name = "event_idx"
+        return out
+
+
 # ============================================================
 # __main__ self-test
 # ============================================================
