@@ -167,7 +167,7 @@ def make_turtle_breakout_trigger(
         entry_low = ind["entry_low"].values
         atr = ind["atr"].values
 
-        # turtle_math fallback: zero/NaN ATR -> use 1.0
+        # zero/NaN ATR -> use 1.0
         valid_atr = np.where((~np.isnan(atr)) & (atr > 0), atr, 1.0)
 
         long_breakout = (close > entry_high) & (~np.isnan(entry_high))

@@ -2,7 +2,7 @@
 
 A hybrid **C++ / Python** automated trading system built on a **unified 6-phase quant architecture** with ABC contracts, bracket-order execution, and YAML-driven strategy assembly.
 
-One strategy brain (`shared/core_logic/turtle_math.py`) powers everything. One ML pipeline (`research/` → `core/strategy_wrapper.py`) bridges research to execution.
+Pluggable strategy components (`trigger` / `labeler` / `sizer` / `risk_manager`) power everything. Indicator formulas are single-sourced in `research/indicator_spec.py`; one ML pipeline (`research/` → `core/strategy_wrapper.py`) bridges research to execution.
 
 | Mode | Engine | When to use |
 |------|--------|-------------|
@@ -12,15 +12,13 @@ One strategy brain (`shared/core_logic/turtle_math.py`) powers everything. One M
 
 ### Strategy signals
 
-`calculate_turtle_signals(df, entry_period, exit_period, atr_period, atr_mult)` returns a signal and a stop price:
+A strategy is assembled from pluggable objects (see §7 "Adding a new strategy"). The entry rule is a `BaseEventTrigger`:
 
 | Signal | Meaning |
 |--------|---------|
-| `1` | Open Long — price broke above `entry_period`-bar high |
-| `-1` | Open Short — price broke below `entry_period`-bar low |
-| `2` | Close Long — price broke below `exit_period`-bar low |
-| `-2` | Close Short — price broke above `exit_period`-bar high |
-| `0` | No action |
+| `1` | Open Long (e.g. close broke above the `entry_period`-bar high) |
+| `-1` | Open Short (e.g. close broke below the `entry_period`-bar low) |
+| `0` | No event |
 
 ---
 
@@ -362,9 +360,9 @@ LivePositionGate().check_risk_limits({"current_position": 0.0})  # True
 
 | File | Role |
 |------|------|
-| `core/strategy_wrapper.py` | Loads model, computes signals via `calculate_turtle_signals()`, emits `OrderPayload` |
+| `core/strategy_wrapper.py` | Loads model, computes signals via the injected `trigger`, emits `OrderPayload` |
 | `core/order_payload.py` | Bracket order data contract |
-| `shared/core_logic/turtle_math.py` | `calculate_turtle_signals()` — single source of truth |
+| `research/indicator_spec.py` | `ROLLING_SPEC` — single source of truth for indicator formulas |
 | `live_strategy/zmq_feeder.py` | ZMQ → buffer → callback |
 | `live_strategy/zmq_gateway.py` | Sends `OrderPayload` to C++ |
 | `live_strategy/live_trend_bot.py` | Composition shell |
@@ -387,7 +385,7 @@ C++ ZMQ PUB kline
     → StrategyWrapper.on_bar()
         ├─ WAITING_CLOSE? → skip
         ├─ risk_manager.check()? → blocked? → skip
-        ├─ calculate_turtle_signals(df, ...)  ← shared brain
+        ├─ trigger.generate_signals(ind)  ← injected entry rule
         ├─ feature.compute_one() → ML predict → score > threshold?
         ├─ sizer.calculate_size() → size
         └─ OrderPayload(action, qty, price, stop, trailing_exit, period)
@@ -476,7 +474,7 @@ live_strategy/                 Execution layer (Phase 5-6)
   zmq_gateway.py               BinanceZmqExecutionGateway
   live_trend_bot.py            Composition shell
 config/                        YAML strategy assembly
-shared/                        config.json + core_logic/turtle_math.py
+shared/                        config.json (ZMQ ports, API keys, backtest risk)
 live_engine/                   C++ engine (unchanged)
 data/                          Data pipeline
 tests/                         Unit + parity tests
@@ -547,3 +545,53 @@ Details baked into the scripts:
 - Scripts output engines to `live_engine/build_cmake/` (not `build/Debug/`).
 
 If PowerShell blocks `.ps1`, run `powershell -ExecutionPolicy Bypass -File build.ps1`.
+
+---
+
+## 10. Adding a New Strategy
+
+A strategy is a set of **pluggable objects** wired together — you never edit the
+engine or the framework, you write (or reuse) components.
+
+### The 5 pluggable objects
+
+| Object | ABC | What it does | Write it? |
+|--------|-----|--------------|-----------|
+| Trigger (entry) | `BaseEventTrigger.generate_signals()` | returns `{-1,0,1}` events | usually yes |
+| Labeler (exit / barrier) | `BaseLabeler.compute_labels()` | per-event `exit_idx` / `exit_price` / `label` | usually yes |
+| Feature set (ML input) | `BaseFeature.compute()` / `compute_one()` | feature vector per event | often reuse |
+| Sizer (size) | `BasePositionSizer.calculate_size()` | signal context → contract size | usually reuse |
+| Risk manager (gate) | `BaseRiskManager.check_risk_limits()` | `False` blocks entries | usually reuse |
+
+Reusable implementations: `research/triggers/` (Adam / Turtle breakouts),
+`research/labeling.py` (TripleBarrier / FixedHorizon / TrailingExit /
+TurtleExit), `execution/sizers.py`, `execution/risk_managers.py`.
+
+### The two research ↔ execution bridges
+
+Only two artifacts cross from research (Phase 1-3) into execution (Phase 4-5):
+
+1. **Model + feature list** — `model.json` + `features.json` (the ML filter).
+2. **Indicator formulas** — `research/indicator_spec.py` `ROLLING_SPEC` is the
+   single source of truth; both the vectorized `add_indicators` and the
+   streaming `IncrementalIndicators` are thin interpreters of it.
+
+### Checklist for a new strategy
+
+1. **Write the trigger** — a new `BaseEventTrigger` in `research/triggers/`.
+2. **Write the labeler** (the "barrier") — a new `BaseLabeler` in
+   `research/labeling.py`. This is the exit rule used for research labeling +
+   `lightweight_backtest`.
+3. **Add indicators if needed** — one line in `ROLLING_SPEC`; both backends
+   pick it up automatically. (New input transforms go in `indicator_spec.py`.)
+4. **C++ exit** — if your exit is in the fixed rule set (fixed stop / trailing
+   Donchian low·high / MA), set `bracket.trailing_exit_indicator` in config —
+   **no C++ change**. If it's a brand-new exit mechanism, add one `else if`
+   branch in `live_engine/src/core/trailing_stop.cpp` and rebuild.
+5. **Wire it in config** — point the `trigger` / `features` / `position_sizer`
+   / `risk_manager` / `bracket` sections at your components.
+6. **Run Phase 3** to train the ML filter (or run without it), then Phase 5
+   backtest to validate.
+
+The framework itself never needs editing — triggers, labelers, sizers, and risk
+managers are dependency-injected, and indicator formulas are declarative.

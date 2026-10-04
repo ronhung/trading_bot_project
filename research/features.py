@@ -6,7 +6,7 @@ Design: two-layer architecture for guaranteed zero-lookahead.
 1. Precompute layer (add_indicators):
    Adds rolling indicator columns to a COPY of the DataFrame.
    All columns use .shift(1) so row `i` only contains data from <= `i`.
-   This mirrors the formulas in shared/core_logic/turtle_math.py exactly.
+   The rolling formulas are single-sourced in research/indicator_spec.py.
 
 2. Feature callables:
    fn(df, event_idx) -> {feature_name: value}
@@ -19,10 +19,27 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Callable, Optional, Tuple
 
+from research.indicator_spec import ROLLING_SPEC, input_series
+
 
 # ============================================================
 # 1. Indicator precomputation (shared foundation)
 # ============================================================
+
+def _rolling(series: pd.Series, op: str, period: int) -> pd.Series:
+    """Dispatch a ROLLING_SPEC `op` onto a pandas rolling window."""
+    r = series.rolling(period)
+    if op == "max":
+        return r.max()
+    if op == "min":
+        return r.min()
+    if op == "mean":
+        return r.mean()
+    if op == "std":
+        return r.std(ddof=0)
+    if op == "sum":
+        return r.sum()
+    raise ValueError(f"unknown rolling op: {op}")
 
 def add_indicators(
     df: pd.DataFrame,
@@ -36,7 +53,7 @@ def add_indicators(
     Add rolling indicator columns to a COPY of the DataFrame.
 
     All indicators use .shift(1) — row `i` only uses data from bars <= `i`.
-    Formulas exactly mirror shared/core_logic/turtle_math.py.
+    Rolling formulas are driven by research/indicator_spec.py (ROLLING_SPEC).
 
     This is the SINGLE SOURCE OF TRUTH for indicator periods. Feature
     callables/classes are pure readers — they never recompute indicators,
@@ -64,30 +81,21 @@ def add_indicators(
       ret_5, ret_10, ret_30, ma, atr_daily, taker_buy_ratio
     """
     out = df.copy()
+    params = {
+        "entry_period": entry_period, "exit_period": exit_period,
+        "atr_period": atr_period, "vol_period": vol_period, "ma_period": ma_period,
+    }
 
-    # --- Donchian channels (shifted: row i uses only bars < i) ---
-    out["entry_high"] = out["high"].rolling(entry_period).max().shift(1)
-    out["entry_low"]  = out["low"].rolling(entry_period).min().shift(1)
-    out["exit_high"]  = out["high"].rolling(exit_period).max().shift(1)
-    out["exit_low"]   = out["low"].rolling(exit_period).min().shift(1)
+    # --- Rolling indicators (declarative spec; every entry is .shift(1)) ---
+    for spec in ROLLING_SPEC:
+        series = input_series(out, spec["input"])
+        out[spec["name"]] = _rolling(series, spec["op"], params[spec["period"]]).shift(1)
 
-    # --- ATR: True Range, shifted rolling mean ---
-    pc = out["close"].shift(1)
-    tr1 = out["high"] - out["low"]
-    tr2 = (out["high"] - pc).abs()
-    tr3 = (out["low"] - pc).abs()
-    out["atr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1) \
-                     .rolling(atr_period).mean().shift(1)
-
-    # --- Volume metrics (ratio + z-score, both shifted) ---
-    out["vol_ma"] = out["volume"].rolling(vol_period).mean().shift(1)
+    # --- Derived (element-wise) columns ---
     out["vol_ratio"] = out["volume"] / out["vol_ma"]
     log_vol = np.log(out["volume"].replace(0, np.nan))
-    vol_mean = log_vol.rolling(vol_period).mean().shift(1)
-    vol_std = log_vol.rolling(vol_period).std(ddof=0).shift(1)
-    out["vol_zscore"] = (log_vol - vol_mean) / vol_std.replace(0, np.nan)
+    out["vol_zscore"] = (log_vol - out["vol_mean"]) / out["vol_std"].replace(0, np.nan)
 
-    # --- Channel position (where price sits within the Donchian band) ---
     channel_range = out["entry_high"] - out["entry_low"]
     out["channel_pos"] = np.where(
         channel_range > 0,
@@ -95,24 +103,20 @@ def add_indicators(
         0.5,
     )
 
-    # --- Lagged returns ---
     for p in [5, 10, 30]:
         out[f"ret_{p}"] = out["close"] / out["close"].shift(p) - 1.0
 
-    # --- Trend moving average (configurable period) ---
-    out["ma"] = out["close"].rolling(ma_period).mean().shift(1)
-
-    # --- Daily ATR as percentage of price (for volatility normalization) ---
-    # atr is absolute ($); divide by close to get decimal; rolling 1440 smooths it
+    # --- Daily ATR (second-order rolling over atr/close; not needed by the
+    #     streaming brain, so it's not in ROLLING_SPEC) ---
     atr_pct_raw = out["atr"] / out["close"]
-    out["atr_daily"] = atr_pct_raw.rolling(1440).mean()  # ~1-day ATR as fraction of price
+    out["atr_daily"] = atr_pct_raw.rolling(1440).mean()
 
     # --- Taker flow (if columns exist in the data) ---
     if "taker_buy_base" in out.columns and "volume" in out.columns:
-        out["taker_buy_ratio"] = (
-            out["taker_buy_base"].rolling(vol_period).sum().shift(1)
-            / out["volume"].rolling(vol_period).sum().shift(1)
-        )
+        out["taker_buy_ratio"] = out["taker_sum"] / out["vol_sum"]
+
+    # Drop the internal rolling columns callers never read.
+    out = out.drop(columns=["vol_mean", "vol_std", "taker_sum", "vol_sum"])
 
     return out
 
@@ -140,13 +144,13 @@ def feature_atr(df: pd.DataFrame, idx: int) -> Dict[str, float]:
 
 
 def feature_breakout_intensity(df: pd.DataFrame, idx: int) -> Dict[str, float]:
-    """Breakout strength normalized by ATR. Matches turtle_math intensity formula."""
+    """Breakout strength normalized by ATR (matches the intensity formula)."""
     close = df["close"].iloc[idx]
     entry_high = _safe_loc(df, idx, "entry_high")
     entry_low = _safe_loc(df, idx, "entry_low")
     atr_val = _safe_loc(df, idx, "atr", 1.0)
     if atr_val <= 0:
-        atr_val = 1.0  # turtle_math fallback
+        atr_val = 1.0  # zero/NaN ATR fallback
 
     long_intensity = (close - entry_high) / atr_val if pd.notna(entry_high) else 0.0
     short_intensity = (entry_low - close) / atr_val if pd.notna(entry_low) else 0.0
@@ -308,7 +312,7 @@ class VolumeRatioFeature(BaseFeature):
 
 
 class BreakoutIntensityFeature(BaseFeature):
-    """Breakout strength normalized by ATR (matches turtle_math intensity)."""
+    """Breakout strength normalized by ATR (matches the intensity formula)."""
 
     def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
         return _CallableFeature(feature_breakout_intensity, "breakout_intensity").compute(data, events)

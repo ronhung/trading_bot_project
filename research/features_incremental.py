@@ -23,6 +23,23 @@ import math
 from collections import deque
 from typing import Dict, Optional
 
+from research.indicator_spec import ROLLING_SPEC, input_value
+
+
+def _make_tracker(op: str, period: int):
+    """Instantiate the rolling tracker for a ROLLING_SPEC `op`."""
+    if op == "max":
+        return _RollingMax(period)
+    if op == "min":
+        return _RollingMin(period)
+    if op == "mean":
+        return _RollingMean(period)
+    if op == "sum":
+        return _RollingSum(period)
+    if op == "std":
+        return _RollingStd(period)
+    raise ValueError(f"unknown rolling op: {op}")
+
 
 class _RollingMax:
     """O(1) amortized rolling max via a monotonic-decreasing deque."""
@@ -157,6 +174,9 @@ class _RollingStd:
         var = self._sumsq / self.period - mean * mean
         return math.sqrt(var) if var > 0 else 0.0
 
+    def value(self) -> float:
+        return self.std()
+
 
 class IncrementalIndicators:
     """
@@ -176,17 +196,14 @@ class IncrementalIndicators:
         vol_period: int = 20,
         ma_period: int = 200,
     ):
-        self._entry_high = _RollingMax(entry_period)
-        self._entry_low = _RollingMin(entry_period)
-        self._exit_high = _RollingMax(exit_period)
-        self._exit_low = _RollingMin(exit_period)
-        self._atr = _RollingMean(atr_period)
-        self._vol_ma = _RollingMean(vol_period)
-        self._log_vol_mean = _RollingMean(vol_period)
-        self._log_vol_std = _RollingStd(vol_period)
-        self._ma = _RollingMean(ma_period)
-        self._taker_sum = _RollingSum(vol_period)
-        self._vol_sum = _RollingSum(vol_period)
+        params = {
+            "entry_period": entry_period, "exit_period": exit_period,
+            "atr_period": atr_period, "vol_period": vol_period, "ma_period": ma_period,
+        }
+        self._trackers: Dict[str, object] = {}
+        for spec in ROLLING_SPEC:
+            period = params[spec["period"]]
+            self._trackers[spec["name"]] = _make_tracker(spec["op"], period)
 
         self._ret_periods = (5, 10, 30)
         self._max_ret = max(self._ret_periods)
@@ -194,31 +211,29 @@ class IncrementalIndicators:
         self._prev_close: Optional[float] = None
 
     def update(self, bar: Dict) -> Dict[str, float]:
-        high = float(bar["high"])
-        low = float(bar["low"])
         close = float(bar["close"])
         volume = float(bar.get("volume", 0.0))
         has_taker = "taker_buy_base" in bar
-        taker = float(bar.get("taker_buy_base", 0.0))
 
-        # ---- shifted indicators (previous N bars, excluding current) ----
-        entry_high = self._entry_high.value()
-        entry_low = self._entry_low.value()
-        exit_high = self._exit_high.value()
-        exit_low = self._exit_low.value()
-        atr = self._atr.value()
-        vol_ma = self._vol_ma.value()
-        log_vol_mean = self._log_vol_mean.value()
-        log_vol_std = self._log_vol_std.std()
-        ma = self._ma.value()
+        # ---- shifted rolling values (previous N bars, excluding current) ----
+        vals = {name: trk.value() for name, trk in self._trackers.items()}
+        entry_high = vals["entry_high"]
+        entry_low = vals["entry_low"]
+        exit_high = vals["exit_high"]
+        exit_low = vals["exit_low"]
+        atr = vals["atr"]
+        vol_ma = vals["vol_ma"]
+        vol_mean = vals["vol_mean"]
+        vol_std = vals["vol_std"]
+        ma = vals["ma"]
 
-        # ---- non-shifted indicators (mix current + shifted state) ----
+        # ---- derived (element-wise) columns ----
         log_vol = math.log(volume) if volume > 0 else float("nan")
         vol_ratio = (volume / vol_ma
                      if (not math.isnan(vol_ma) and vol_ma != 0) else float("nan"))
-        if (not math.isnan(log_vol) and not math.isnan(log_vol_mean)
-                and not math.isnan(log_vol_std) and log_vol_std != 0):
-            vol_zscore = (log_vol - log_vol_mean) / log_vol_std
+        if (not math.isnan(log_vol) and not math.isnan(vol_mean)
+                and not math.isnan(vol_std) and vol_std != 0):
+            vol_zscore = (log_vol - vol_mean) / vol_std
         else:
             vol_zscore = float("nan")
 
@@ -249,34 +264,17 @@ class IncrementalIndicators:
                 result[f"ret_{p}"] = float("nan")
 
         if has_taker:
-            ts = self._taker_sum.value()
-            vs = self._vol_sum.value()
+            ts = vals["taker_sum"]
+            vs = vals["vol_sum"]
             result["taker_buy_ratio"] = (ts / vs
                                          if (not math.isnan(ts) and not math.isnan(vs) and vs != 0)
                                          else float("nan"))
 
         # ---- push current bar into rolling state ----
-        self._entry_high.push(high)
-        self._entry_low.push(low)
-        self._exit_high.push(high)
-        self._exit_low.push(low)
-
-        if self._prev_close is None:
-            tr = high - low
-        else:
-            tr = max(high - low, abs(high - self._prev_close), abs(low - self._prev_close))
-        self._atr.push(tr)
-
-        self._vol_ma.push(volume)
-        if not math.isnan(log_vol):
-            self._log_vol_mean.push(log_vol)
-            self._log_vol_std.push(log_vol)
-
-        self._ma.push(close)
-
-        if has_taker:
-            self._taker_sum.push(taker)
-            self._vol_sum.push(volume)
+        for spec in ROLLING_SPEC:
+            value = input_value(bar, self._prev_close, spec["input"])
+            if not math.isnan(value):
+                self._trackers[spec["name"]].push(value)
 
         self._close_hist.append(close)
         while len(self._close_hist) > self._max_ret:

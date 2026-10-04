@@ -266,7 +266,7 @@ class StrategyWrapper:
             cls_ = getattr(module, class_name)
             return cls_(**params)
 
-        # Trigger (research path; execution uses turtle_math directly)
+        # Trigger (pluggable entry rule)
         trigger = _instantiate(cfg["trigger"])
 
         # Features

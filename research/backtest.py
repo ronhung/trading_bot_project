@@ -7,8 +7,8 @@ Design:
      one position at a time) and builds a mark-to-market equity curve.
   3. Metrics (Sharpe, drawdown, win rate) computed vectorized from the equity curve.
 
-Shares add_indicators() from research.features — the indicator formulas
-exactly mirror shared/core_logic/turtle_math.py.
+Shares add_indicators() from research.features — the indicator formulas are
+single-sourced in research/indicator_spec.py (ROLLING_SPEC).
 
 Zero Backtrader dependency.  Suitable for large parameter sweeps.
 """

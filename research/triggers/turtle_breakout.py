@@ -70,7 +70,7 @@ class TurtleBreakoutTrigger(BaseEventTrigger):
         entry_low = ind["entry_low"].values
         atr = ind["atr"].values
 
-        # Guard: zero/NaN ATR → use 1.0 (matches turtle_math.py fallback)
+        # Guard: zero/NaN ATR → use 1.0
         valid_atr = np.where((~np.isnan(atr)) & (atr > 0), atr, 1.0)
 
         # Breakout detection (vectorized)
