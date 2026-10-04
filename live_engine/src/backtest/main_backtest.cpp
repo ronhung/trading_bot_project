@@ -46,6 +46,8 @@ int main(int argc, char** argv) {
         std::string csv_path = (root / "data" / "historical_data" / "BTCUSDT_1m_full.csv").string();
         std::string trades_out = (root / "data" / "historical_data" / "backtest_trades.csv").string();
         double initial_balance = 100000.0;
+        double risk_pct = 0.02;
+        double max_leverage = 20.0;
 
         if (argc >= 2) csv_path = argv[1];
         if (argc >= 3) trades_out = argv[2];
@@ -59,14 +61,23 @@ int main(int argc, char** argv) {
             config_file >> config;
             pub_port = config.value("/zmq/market_feed_port"_json_pointer, 5555);
             pull_port = config.value("/zmq/signal_port"_json_pointer, 5556);
-            if (config.contains("backtest") && config["backtest"].contains("initial_balance")) {
-                initial_balance = config["backtest"]["initial_balance"].get<double>();
+            if (config.contains("backtest")) {
+                auto& bt = config["backtest"];
+                if (bt.contains("initial_balance")) {
+                    initial_balance = bt["initial_balance"].get<double>();
+                }
+                if (bt.contains("risk_pct")) {
+                    risk_pct = bt["risk_pct"].get<double>();
+                }
+                if (bt.contains("max_leverage")) {
+                    max_leverage = bt["max_leverage"].get<double>();
+                }
             }
         } else {
             std::cout << "⚠️ Config not found at " << config_path << " (using defaults)" << std::endl;
         }
 
-        RiskManager risk_manager(0.02, 20.0);
+        RiskManager risk_manager(risk_pct, max_leverage);
         risk_manager.update_balance(initial_balance);
         risk_manager.update_position(0.0);
 

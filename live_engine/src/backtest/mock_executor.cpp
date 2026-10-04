@@ -144,21 +144,26 @@ bool MockExecutor::send_order(const std::string& symbol,
     return false; // unknown side
 }
 
+void MockExecutor::arm_trailing_exit(const std::string& indicator, int period) {
+    double pos = risk_ ? risk_->get_current_position() : 0.0;
+    if (pos == 0.0) return;
+    int side = (pos > 0.0) ? 1 : -1;
+    double hard_stop = risk_->get_stop_price();
+    trailing_stop_.configure(indicator, period);
+    trailing_stop_.on_entry(side, hard_stop);
+}
+
 bool MockExecutor::check_and_execute_stop(const std::string& symbol) {
-    double pos = risk_->get_current_position();
-    double stop = risk_->get_stop_price();
-    if (pos == 0.0 || stop <= 0.0) {
+    if (!risk_ || risk_->get_current_position() == 0.0) {
         return false;
     }
-
-    if (pos > 0.0 && current_bar_.low <= stop) {
-        std::cout << "🛑 [MockExecutor] LONG stop hit @ " << stop << std::endl;
-        send_order(symbol, "SELL", std::abs(pos), stop, true);
-        return true;
-    }
-    if (pos < 0.0 && current_bar_.high >= stop) {
-        std::cout << "🛑 [MockExecutor] SHORT stop hit @ " << stop << std::endl;
-        send_order(symbol, "BUY", std::abs(pos), stop, true);
+    double exit_price = 0.0;
+    std::string reason;
+    if (trailing_stop_.on_bar(current_bar_, exit_price, reason)) {
+        double pos = risk_->get_current_position();
+        std::string close_side = (pos > 0.0) ? "SELL" : "BUY";
+        std::cout << "🛑 [MockExecutor] " << reason << " hit @ " << exit_price << std::endl;
+        send_order(symbol, close_side, std::abs(pos), exit_price, true);
         return true;
     }
     return false;

@@ -12,6 +12,7 @@ RESPONSIBILITY BOUNDARY:
 
 from enum import Enum, auto
 from typing import Optional, Dict, Any, List
+from collections import deque
 import logging
 
 import numpy as np
@@ -87,7 +88,10 @@ class StrategyWrapper:
         self._indicator_params = indicator_params or {}
 
         self._state: StrategyState = StrategyState.IDLE
-        self._kline_buffer: List[Dict[str, Any]] = []
+        # Cap the buffer to the largest indicator lookback (avoids unbounded
+        # growth + O(n^2) recompute on the live/backtest hot loop).
+        max_len = max(self._indicator_params.values()) + 1 if self._indicator_params else 1000
+        self._kline_buffer: deque = deque(maxlen=max_len)
 
     # -- public API -------------------------------------------------------
 

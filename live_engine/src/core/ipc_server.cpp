@@ -178,6 +178,12 @@ void IpcServer::handle_message(const std::string& msg_str) {
     std::string symbol = j.value("symbol", "BTCUSDT");
     double price = j.value("price", 0.0);
     double stop_price = j.value("stop_price", 0.0);
+    std::string trailing_indicator = "none";
+    int trailing_period = 0;
+    if (j.contains("trailing_exit")) {
+        trailing_indicator = j["trailing_exit"].value("indicator", "none");
+        trailing_period = j["trailing_exit"].value("period", 0);
+    }
 
     std::cout << "\n⚡ [C++ Received command] action: " << action
               << " | symbol: " << symbol
@@ -211,6 +217,7 @@ void IpcServer::handle_message(const std::string& msg_str) {
         bool ok = executor_->send_order(symbol, action, safe_quantity, price, false);
         if (ok) {
             risk_manager_->set_stop_price(stop_price);
+            executor_->arm_trailing_exit(trailing_indicator, trailing_period);
         } else {
             std::cout << "❌ [IPC] Order rejected by executor (not tracked)." << std::endl;
         }

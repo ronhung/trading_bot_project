@@ -74,6 +74,7 @@ find_package(OpenSSL REQUIRED)
 set(CORE_SOURCES
     src/core/risk_manager.cpp
     src/core/ipc_server.cpp
+    src/core/trailing_stop.cpp
 )
 
 set(CORE_INCLUDE_DIRS

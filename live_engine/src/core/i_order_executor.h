@@ -39,6 +39,12 @@ public:
     // Used by IpcServer to reject duplicate open signals.
     virtual bool has_open_order() const { return false; }
 
+    // Arm a trailing exit for the just-opened position. The executor reads
+    // the current side + stop from its RiskManager. Default no-op.
+    virtual void arm_trailing_exit(const std::string& indicator, int period) {
+        (void)indicator; (void)period;
+    }
+
     // Query the current position on the exchange for the given symbol.
     // Returns false if the executor cannot verify the position.
     virtual bool get_current_position(const std::string& symbol, double& out_position) {

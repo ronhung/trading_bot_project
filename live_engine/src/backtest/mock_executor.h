@@ -5,6 +5,7 @@
 #include "../core/i_order_executor.h"
 #include "../core/risk_manager.h"
 #include "../core/kline_data.h"
+#include "../core/trailing_stop.h"
 
 struct TradeRecord {
     uint64_t timestamp_ms = 0;
@@ -35,6 +36,7 @@ public:
     bool get_current_position(const std::string& symbol, double& out_position) override;
     // Returns true if a stop was triggered and a close was filled.
     bool check_and_execute_stop(const std::string& symbol);
+    void arm_trailing_exit(const std::string& indicator, int period) override;
 
     void export_trades_csv(const std::string& path) const;
     const std::vector<TradeRecord>& trades() const { return trades_; }
@@ -49,5 +51,6 @@ private:
     double fee_rate_;
     double slippage_bps_; // 1 bps = 0.01%
     KLineData current_bar_;
+    TrailingStop trailing_stop_;
     std::vector<TradeRecord> trades_;
 };
