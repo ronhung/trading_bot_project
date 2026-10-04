@@ -16,6 +16,7 @@ Zero Backtrader dependency.  Suitable for large parameter sweeps.
 import os
 import sys
 import math
+from collections import deque
 import numpy as np
 import pandas as pd
 from typing import Dict, Optional
@@ -50,46 +51,33 @@ def _get_features_at_bar(df, bar_idx, feature_cols, pipeline):
 def lightweight_backtest(
     df: pd.DataFrame,
     trigger,                          # BaseEventTrigger — entry signals (-1/0/1)
-    exit_labeler,                     # BaseLabeler — per-event exit (exit_idx/exit_price/barrier_hit)
-    indicator_params: Optional[Dict] = None,
+    exit_labeler,                     # BaseLabeler — per-event exit (+ optional stop_distance)
+    position_sizer,                   # BasePositionSizer — pluggable sizing
+    risk_manager=None,                # BaseRiskManager — optional entry gate
+    risk_window: int = 129600,        # rolling window (bars) for the drawdown gate
+    signal_strength: float = 1.0,     # passed to the sizer (e.g. ATR multiplier)
     ml_model=None,                    # optional entry filter (classifier or regressor)
     ml_threshold: float = 0.0,
-    ml_feature_cols: Optional[list] = None,  # explicit feature order for the model
-    position_sizer: Optional[BasePositionSizer] = None,
-    risk_manager: Optional[BaseRiskManager] = None,
+    ml_feature_cols: Optional[list] = None,
+    indicator_params: Optional[Dict] = None,
     initial_capital: float = 10000.0,
     commission: float = 0.0005,
-    max_leverage: float = 20.0,
-    risk_pct: float = 0.02,
-    stop_pct: float = 0.02,
-    loss_ratio: Optional[float] = None,   # fixed-risk sizing: risk this % of capital per x-bar range
     verbose: bool = False,
 ) -> dict:
     """
-    Pluggable event-driven backtest.
+    Pluggable event-driven backtest engine.
 
-    Parameters
-    ----------
-    df : OHLCV DataFrame (open/high/low/close/volume), chronological (oldest first).
-    trigger : BaseEventTrigger — generates entry events (-1=short, 1=long, 0=flat).
-    exit_labeler : BaseLabeler — computes per-event exit (columns: exit_idx,
-        exit_price, entry_price, barrier_hit, n_bars_held).
-    indicator_params : dict passed to add_indicators() so the exit labeler (and
-        the optional ML filter) see the right columns. Must match what the ML
-        model was trained on when ml_model is used.
-    ml_model : optional model to filter entries. Classifiers are scored via
-        predict_proba()[:, 1]; regressors via predict().
-    ml_threshold : minimum score to enter; entries below are skipped.
-    position_sizer : BasePositionSizer, or None for inline risk-based sizing.
-    risk_manager : BaseRiskManager, or None.
-    initial_capital, commission, max_leverage, risk_pct, stop_pct : sizing/fee knobs.
+    All strategy-specific pieces are injected as objects:
+      trigger        (BaseEventTrigger)   — entry
+      exit_labeler   (BaseLabeler)        — exit (optionally exposes stop_distance)
+      position_sizer (BasePositionSizer)  — sizing
+      risk_manager   (BaseRiskManager)    — entry gate; drawdown measured over
+                                            the rolling `risk_window` bars
 
-    Returns
-    -------
-    dict with sharpe/win_rate/total_return_pct/max_dd_pct/n_trades/... plus
+    Returns dict with sharpe/win_rate/total_return_pct/max_dd_pct/n_trades/... plus
     equity_curve, trades_df, final_capital.
     """
-    # --- 1. Indicators (for the exit labeler + optional ML filter) ---
+    # --- 1. Indicators ---
     ind = add_indicators(df, **(indicator_params or {}))
 
     # --- 2. Entry events ---
@@ -99,8 +87,7 @@ def lightweight_backtest(
     sides = sig_vals[event_idx].astype(int)
     n = len(ind)
     close = ind["close"].values
-    entry_high_arr = ind["entry_high"].values if "entry_high" in ind.columns else np.full(n, np.nan)
-    entry_low_arr = ind["entry_low"].values if "entry_low" in ind.columns else np.full(n, np.nan)
+    atr = ind["atr"].values if "atr" in ind.columns else np.full(n, np.nan)
 
     # --- 3. Exits ---
     labels = exit_labeler.compute_labels(ind, events)
@@ -118,7 +105,7 @@ def lightweight_backtest(
     stop_distance_arr = labels["stop_distance"].values.astype(float) if "stop_distance" in labels.columns else None
 
     # --- 4. ML filter setup ---
-    _ml_feature_cols = ml_feature_cols  # explicit order, else auto-detect (sorted)
+    _ml_feature_cols = ml_feature_cols
     ml_feature_pipeline = None
     is_classifier = False
     if ml_model is not None:
@@ -128,120 +115,102 @@ def lightweight_backtest(
             sample = ml_feature_pipeline(ind, min(200, n - 1))
             _ml_feature_cols = sorted(sample.keys())
 
-    # --- 5. Process events sequentially (non-overlapping) ---
-    capital = initial_capital
-    trades = []
-    last_exit_idx = -1
-
-    for k in range(len(event_idx)):
-        ei = int(event_idx[k])
-        side = int(sides[k])
-        if ei <= last_exit_idx:
-            continue  # overlapping entry — skip (one position at a time)
-
-        xidx = int(exit_idx_arr[k])
-        eprice = entry_price_arr[k]
-        xprice = exit_price_arr[k]
-        reason = barrier_hit_arr[k]
-
-        # ML filter
-        if ml_model is not None:
-            feats = _get_features_at_bar(ind, ei, _ml_feature_cols, ml_feature_pipeline)
-            if feats is None:
-                continue
-            if is_classifier:
-                score = float(ml_model.predict_proba(feats)[0][1])
-            else:
-                score = float(ml_model.predict(feats)[0])
-            if score <= ml_threshold:
-                if verbose:
-                    print(f"[{ind.index[ei]}] ML FILTER skip {side}, "
-                          f"score={score:.3f} <= {ml_threshold}")
-                continue
-
-        # risk manager
-        if risk_manager is not None:
-            drawdown = (capital - initial_capital) / initial_capital
-            if not risk_manager.check_risk_limits(
-                {"current_drawdown": min(drawdown, 0.0), "current_position": 0.0}
-            ):
-                continue
-
-        # sizing
-        if loss_ratio is not None:
-            # fixed-loss-ratio: risk `loss_ratio` of capital per the ACTUAL
-            # initial-stop distance (entry → trailing-stop start), if the
-            # labeler exposes it; else fall back to the x-bar range.
-            if stop_distance_arr is not None and stop_distance_arr[k] > 0:
-                risk_dist = stop_distance_arr[k]
-            else:
-                risk_dist = entry_high_arr[ei] - entry_low_arr[ei]
-            if risk_dist > 0 and capital > 0:
-                size = (capital * loss_ratio) / risk_dist
-            else:
-                size = 0.0
-        elif position_sizer is not None:
-            size = position_sizer.calculate_size(
-                signal_strength=1.0,
-                current_atr=1.0,
-                account_equity=capital,
-                entry_price=eprice,
-            )
-        else:
-            risk = eprice * stop_pct
-            if risk > 0 and capital > 0:
-                size_risk = (capital * risk_pct) / risk
-                size_cap = (capital * max_leverage) / eprice
-                size = math.floor(min(size_risk, size_cap) * 1000) / 1000.0
-            else:
-                size = 0.0
-        if size <= 0.0:
-            continue
-
-        # PnL
-        raw_pnl = side * (xprice - eprice) * size
-        fees = commission * (eprice + xprice) * size
-        pnl = raw_pnl - fees
-
-        trades.append({
-            "entry_idx": ei,
-            "exit_idx": xidx,
-            "side": side,
-            "entry_price": eprice,
-            "exit_price": xprice,
-            "size": size,
-            "pnl": pnl,
-            "entry_time": ind.index[ei],
-            "exit_time": ind.index[xidx],
-            "bars_held": xidx - ei,
-            "exit_reason": reason,
-            "pnl_pct": pnl / initial_capital * 100.0,
-        })
-        last_exit_idx = xidx
-
-    # --- 6. Mark-to-market equity curve ---
+    # --- 5. Single bar-by-bar loop: entry/exit + mark-to-market equity ---
     capital = initial_capital
     equity = []
     open_trade = None
-    tptr = 0
+    event_ptr = 0
+    trades = []
+
+    # monotonic deque for O(1) rolling max of equity over `risk_window`
+    window = deque()
+
     for i in range(n):
+        # Close the open position at its exit bar
         if open_trade is not None and i >= open_trade["exit_idx"]:
             capital += open_trade["pnl"]
+            trades.append(open_trade)
             open_trade = None
-        if open_trade is None and tptr < len(trades) and trades[tptr]["entry_idx"] == i:
-            open_trade = trades[tptr]
-            tptr += 1
+
+        # Skip events already behind us (fired while we were in a position)
+        while event_ptr < len(event_idx) and event_idx[event_ptr] < i:
+            event_ptr += 1
+
+        # Open a new position if an event fires on this bar (and we are flat)
+        if open_trade is None and event_ptr < len(event_idx) and event_idx[event_ptr] == i:
+            k = event_ptr
+            event_ptr += 1
+            ei = int(event_idx[k])
+            side = int(sides[k])
+            eprice = float(entry_price_arr[k])
+            xprice = float(exit_price_arr[k])
+            xidx = int(exit_idx_arr[k])
+
+            allowed = True
+
+            # risk gate: rolling-peak drawdown
+            if allowed and risk_manager is not None:
+                rolling_peak = equity[window[0]] if window else capital
+                drawdown = (rolling_peak - capital) / rolling_peak if rolling_peak > 0 else 0.0
+                if not risk_manager.check_risk_limits(
+                    {"current_drawdown": drawdown, "current_position": 0.0}
+                ):
+                    allowed = False
+
+            # ML filter
+            if allowed and ml_model is not None:
+                feats = _get_features_at_bar(ind, ei, _ml_feature_cols, ml_feature_pipeline)
+                if feats is None:
+                    allowed = False
+                else:
+                    score = (float(ml_model.predict_proba(feats)[0][1]) if is_classifier
+                             else float(ml_model.predict(feats)[0]))
+                    if score <= ml_threshold:
+                        allowed = False
+
+            # sizing
+            if allowed:
+                sd = stop_distance_arr[k] if stop_distance_arr is not None else np.nan
+                size = position_sizer.calculate_size(
+                    signal_strength=signal_strength,
+                    current_atr=float(atr[ei]) if not np.isnan(atr[ei]) else 1.0,
+                    account_equity=capital,
+                    entry_price=eprice,
+                    stop_distance=float(sd) if not np.isnan(sd) else None,
+                )
+                if size <= 0.0:
+                    allowed = False
+
+            if allowed:
+                raw_pnl = side * (xprice - eprice) * size
+                fees = commission * (eprice + xprice) * size
+                pnl = raw_pnl - fees
+                open_trade = {
+                    "entry_idx": ei, "exit_idx": xidx, "side": side,
+                    "entry_price": eprice, "exit_price": xprice, "size": size, "pnl": pnl,
+                    "entry_time": ind.index[ei], "exit_time": ind.index[xidx],
+                    "bars_held": xidx - ei, "exit_reason": barrier_hit_arr[k],
+                    "pnl_pct": pnl / initial_capital * 100.0,
+                }
+
+        # Mark-to-market equity + maintain rolling-max deque
         unrealized = 0.0
         if open_trade is not None:
             unrealized = open_trade["side"] * (close[i] - open_trade["entry_price"]) * open_trade["size"]
         equity.append(capital + unrealized)
 
+        while window and equity[window[-1]] <= equity[-1]:
+            window.pop()
+        window.append(len(equity) - 1)
+        if window[0] <= (len(equity) - 1) - risk_window:
+            window.popleft()
+
+    # --- 6. Metrics ---
     equity_arr = np.array(equity)
     trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(
         columns=["entry_idx", "exit_idx", "side", "entry_price", "exit_price", "size",
                  "pnl", "entry_time", "exit_time", "bars_held", "exit_reason", "pnl_pct"])
 
-    # --- 7. Metrics ---
     trades_metrics = [
         {"pnl": t["pnl"], "bars_held": t["bars_held"],
          "entry_price": t["entry_price"], "exit_price": t["exit_price"], "size": t["size"]}
@@ -411,16 +380,18 @@ if __name__ == "__main__":
           f"atr_period={args.atr_period}, atr_mult={args.atr_mult}, "
           f"capital={args.capital}, risk_pct={args.risk_pct}")
     t0 = time.perf_counter()
+    from execution.sizers import VolatilityTargetingSizer
     result = lightweight_backtest(
         df,
         trigger=trigger,
         exit_labeler=exit_labeler,
+        position_sizer=VolatilityTargetingSizer(risk_pct=args.risk_pct, max_leverage=20.0),
+        signal_strength=args.atr_mult,
         indicator_params={"entry_period": args.entry, "exit_period": args.exit,
                           "atr_period": args.atr_period},
         ml_model=ml_model,
         ml_threshold=ml_threshold,
         initial_capital=args.capital,
-        risk_pct=args.risk_pct,
     )
     elapsed = time.perf_counter() - t0
 

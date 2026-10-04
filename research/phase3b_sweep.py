@@ -29,6 +29,7 @@ from research.backtest import lightweight_backtest
 from research.param_sweep import run_parameter_sweep
 from research.triggers.turtle_breakout import TurtleBreakoutTrigger
 from research.labeling import TurtleExitLabeler
+from execution.sizers import VolatilityTargetingSizer
 
 
 # ============================================================
@@ -61,10 +62,11 @@ def _sweep_target(
         raw_data,
         trigger=trigger,
         exit_labeler=exit_labeler,
+        position_sizer=VolatilityTargetingSizer(risk_pct=0.02, max_leverage=20.0),
+        signal_strength=atr_mult,
         indicator_params={"entry_period": entry_period, "exit_period": entry_period // 2,
                           "atr_period": entry_period},
         initial_capital=10000.0,
-        max_leverage=20.0,
         verbose=False,
     )
 
@@ -167,9 +169,10 @@ def main() -> int:
             df_test,
             trigger=trigger,
             exit_labeler=exit_labeler,
+            position_sizer=VolatilityTargetingSizer(risk_pct=0.02, max_leverage=20.0),
+            signal_strength=am,
             indicator_params={"entry_period": ep, "exit_period": ep // 2, "atr_period": ep},
             initial_capital=10000.0,
-            max_leverage=20.0,
             verbose=False,
         )
         validation.append({

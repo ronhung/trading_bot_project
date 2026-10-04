@@ -68,7 +68,7 @@ class ModelEvaluator:
             "label", "barrier_hit", "exit_idx", "n_bars_held",
             "entry_price", "exit_price", "actual_return", "return_atr",
             "raw_return", "y_norm", "truncated",
-            "event_time", "side", "stop_distance",
+            "event_time", "side", "stop_distance", "r_multiple",
         }
         self.ic_threshold = ic_threshold
         self.n_quantiles = n_quantiles

@@ -691,7 +691,7 @@ class TrailingExitLabeler(BaseLabeler):
         event_mask = events != 0 if events.dtype == int else events.astype(bool)
         event_indices = np.flatnonzero(np.asarray(event_mask.values))
         cols = ["label", "barrier_hit", "exit_idx", "n_bars_held",
-                "entry_price", "exit_price", "stop_distance", "actual_return"]
+                "entry_price", "exit_price", "stop_distance", "actual_return", "r_multiple"]
         if len(event_indices) == 0:
             return pd.DataFrame(columns=cols)
 
@@ -718,6 +718,7 @@ class TrailingExitLabeler(BaseLabeler):
         reason_list = []
         n_bars_list = []
         stop_distance_list = []
+        r_multiple_list = []
 
         for ev, side in zip(event_indices, sides):
             entry_price = close[ev]
@@ -745,10 +746,12 @@ class TrailingExitLabeler(BaseLabeler):
                 exit_price = close[n - 1]
                 reason = "still_open"
 
+            r_multiple = (side * (exit_price - entry_price)) / stop_distance
             exit_idx_list.append(exit_idx)
             exit_price_list.append(exit_price)
             reason_list.append(reason)
             n_bars_list.append(exit_idx - ev)
+            r_multiple_list.append(r_multiple)
 
         entry_prices = close[event_indices]
         exit_prices = np.asarray(exit_price_list, dtype=float)
@@ -769,6 +772,7 @@ class TrailingExitLabeler(BaseLabeler):
             "exit_price": exit_prices,
             "stop_distance": np.asarray(stop_distance_list, dtype=float),
             "actual_return": actual_return,
+            "r_multiple": np.asarray(r_multiple_list, dtype=float),
         }, index=event_indices)
         out.index.name = "event_idx"
         return out

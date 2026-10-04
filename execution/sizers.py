@@ -41,6 +41,7 @@ class VolatilityTargetingSizer(BasePositionSizer):
         current_atr: float,
         account_equity: float,
         entry_price: float | None = None,
+        stop_distance: float | None = None,
     ) -> float:
         """
         Compute position size using Turtle N-value logic.
@@ -75,4 +76,43 @@ class VolatilityTargetingSizer(BasePositionSizer):
         # Floor to min_size precision
         size = math.floor(size / self.min_size) * self.min_size
 
+        return size if size >= self.min_size else 0.0
+
+
+class FixedRiskSizer(BasePositionSizer):
+    """
+    Fixed-risk position sizing: risk a fixed fraction of equity per the actual
+    stop distance supplied by the exit labeler.
+
+        size = (account_equity * risk_pct) / stop_distance, capped by max_leverage.
+
+    Used for trailing-stop / barrier exits where the stop distance is a known
+    per-event value (entry → initial stop), not an ATR-derived quantity.
+    """
+
+    def __init__(self, risk_pct: float = 0.10, max_leverage: float = 100.0, min_size: float = 0.001):
+        self.risk_pct = risk_pct
+        self.max_leverage = max_leverage
+        self.min_size = min_size
+
+    def calculate_size(
+        self,
+        signal_strength: float,
+        current_atr: float,
+        account_equity: float,
+        entry_price: float | None = None,
+        stop_distance: float | None = None,
+    ) -> float:
+        if account_equity <= 0.0:
+            return 0.0
+        if stop_distance is None or stop_distance <= 0.0:
+            return 0.0
+
+        size = (account_equity * self.risk_pct) / stop_distance
+
+        if entry_price is not None and entry_price > 0.0:
+            max_notional = account_equity * self.max_leverage
+            size = min(size, max_notional / entry_price)
+
+        size = math.floor(size / self.min_size) * self.min_size
         return size if size >= self.min_size else 0.0

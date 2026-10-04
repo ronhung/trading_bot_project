@@ -21,6 +21,7 @@ class BasePositionSizer(ABC):
         current_atr: float,
         account_equity: float,
         entry_price: Optional[float] = None,
+        stop_distance: Optional[float] = None,
     ) -> float:
         """
         Compute position size in base currency units.
@@ -31,6 +32,8 @@ class BasePositionSizer(ABC):
             current_atr: Current ATR value (absolute, in price units).
             account_equity: Available account equity (quote currency).
             entry_price: Entry price (optional). Required for leverage cap.
+            stop_distance: Actual stop distance (entry → stop), supplied by the
+                           exit labeler. Fixed-risk sizers use this directly.
 
         Returns:
             Position size in base units (e.g., BTC). Returns 0.0 to skip.

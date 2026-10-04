@@ -7,7 +7,7 @@ Adam trailing-stop pipeline: Phase 1 -> 3b with the trailing-stop + fixed-loss l
   Phase 3b: Mode A sweep (period x trail_period, no ML), Mode B sweep
             (ml_threshold with fixed config + classifier), walk-forward
 
-Backtest uses TrailingExitLabeler + loss_ratio=0.10 (fixed 10% risk per the
+Backtest uses TrailingExitLabeler + risk_pct=0.10 (fixed 10% risk per the
 actual initial-stop distance).
 """
 
@@ -28,22 +28,29 @@ IND_FULL = {"entry_period": 43200, "exit_period": 14400, "atr_period": 43200,
             "vol_period": 1440, "ma_period": 288000}
 
 
-def _trailing_backtest_target(raw_data, period=43200, trail_period=14400, loss_ratio=0.10,
+def _trailing_backtest_target(raw_data, period=43200, trail_period=14400, risk_pct=0.10,
                               ml_threshold=0.0, ml_model=None, ml_feature_cols=None,
-                              indicator_params=None, **kwargs):
+                              indicator_params=None, max_dd_pct=None, risk_window=129600, **kwargs):
     from research.triggers.adam_breakout import AdamBreakoutTrigger
     from research.labeling import TrailingExitLabeler
     from research.backtest import lightweight_backtest
+    from execution.sizers import FixedRiskSizer
 
     trigger = AdamBreakoutTrigger(period=int(period), signed=True)
     exit_labeler = TrailingExitLabeler(trail_period=int(trail_period))
     if indicator_params is None:
         indicator_params = {"exit_period": int(trail_period)}
+    sizer = FixedRiskSizer(risk_pct=float(risk_pct), max_leverage=100.0)
+    risk_manager = None
+    if max_dd_pct is not None:
+        from execution.risk_managers import MaxDrawdownRiskManager
+        risk_manager = MaxDrawdownRiskManager(max_dd_pct=float(max_dd_pct))
     result = lightweight_backtest(
         raw_data, trigger=trigger, exit_labeler=exit_labeler,
+        position_sizer=sizer, risk_manager=risk_manager, risk_window=int(risk_window),
         indicator_params=indicator_params,
         ml_model=ml_model, ml_threshold=float(ml_threshold), ml_feature_cols=ml_feature_cols,
-        loss_ratio=float(loss_ratio), verbose=False,
+        verbose=False,
     )
     pf = result["profit_factor"]
     return {
@@ -71,8 +78,9 @@ def _build_Xy(df, trail_period=14400):
     X = feature_df.join(labels_df, how="left")
 
     evaluator = ModelEvaluator(target="label")
-    X_np, y_np, feature_names = evaluator.prepare_features(X)
-    y_np = (y_np == 1.0).astype(np.float32)   # 1 = profitable
+    X_np, _, feature_names = evaluator.prepare_features(X)
+    r_mult = X["r_multiple"].values
+    y_np = (r_mult > 2.0).astype(np.float32)   # 1 = big winner (> 2R)
     return X_np, y_np, feature_names, len(X)
 
 
@@ -119,7 +127,7 @@ def main():
 
     # ---- Phase 3b: Mode A (sweep period x trail_period, no ML) ----
     print("\n" + "=" * 78)
-    print("[Phase 3b Mode A] 掃 period × trail_period（無 ML），loss_ratio=10%")
+    print("[Phase 3b Mode A] 掃 period × trail_period（無 ML），risk_pct=10%")
     print("=" * 78)
     grid_A = {
         "period": [10080, 20160, 43200, 64800, 86400],        # 7/14/30/45/60 天
@@ -148,17 +156,17 @@ def main():
     grid_B = {"ml_threshold": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]}
     res_B = run_parameter_sweep(
         target_func=_trailing_backtest_target, param_grid=grid_B, raw_data=train,
-        fixed_kwargs={"period": 43200, "trail_period": 14400, "loss_ratio": 0.10,
+        fixed_kwargs={"period": 43200, "trail_period": 14400, "risk_pct": 0.10,
                       "ml_model": model, "ml_feature_cols": feature_names, "indicator_params": IND_FULL},
         n_jobs=1, rank_by="sharpe",
     )
     print(res_B[["ml_threshold", "sharpe", "n_trades", "win_rate", "total_return_pct", "max_dd_pct"]].to_string(index=False))
 
     best_thr = float(res_B.iloc[0]["ml_threshold"])
-    r_ml = _trailing_backtest_target(test, period=43200, trail_period=14400, loss_ratio=0.10,
+    r_ml = _trailing_backtest_target(test, period=43200, trail_period=14400, risk_pct=0.10,
                                      ml_model=model, ml_feature_cols=feature_names,
                                      ml_threshold=best_thr, indicator_params=IND_FULL)
-    r_no = _trailing_backtest_target(test, period=43200, trail_period=14400, loss_ratio=0.10)
+    r_no = _trailing_backtest_target(test, period=43200, trail_period=14400, risk_pct=0.10)
     print(f"\n  最佳 threshold={best_thr} 在 TEST（out-of-sample）：")
     print(f"    帶 ML  : sharpe={r_ml['sharpe']:.2f} win={r_ml['win_rate']*100:.1f}% trades={r_ml['n_trades']} "
           f"ret={r_ml['total_return_pct']:.1f}% mdd={r_ml['max_dd_pct']:.1f}%")
@@ -184,13 +192,24 @@ def main():
         # evaluate AUC on this test year
         prob = m.predict_proba(Xb)[:, 1]
         a = roc_auc_score(yb, prob)
-        r_ml_w = _trailing_backtest_target(te_df, period=43200, trail_period=14400, loss_ratio=0.10,
+        r_ml_w = _trailing_backtest_target(te_df, period=43200, trail_period=14400, risk_pct=0.10,
                                            ml_model=m, ml_feature_cols=fn, ml_threshold=0.4,
                                            indicator_params=IND_FULL)
-        r_no_w = _trailing_backtest_target(te_df, period=43200, trail_period=14400, loss_ratio=0.10)
+        r_no_w = _trailing_backtest_target(te_df, period=43200, trail_period=14400, risk_pct=0.10)
         print(f"  test {te_s[:4]}: AUC={a:.3f} | 不帶ML sharpe={r_no_w['sharpe']:>6.2f} ret={r_no_w['total_return_pct']:>6.1f}% "
               f"({r_no_w['n_trades']:>3}t) | 帶ML sharpe={r_ml_w['sharpe']:>6.2f} ret={r_ml_w['total_return_pct']:>6.1f}% "
               f"({r_ml_w['n_trades']:>3}t)")
+
+    # ---- Phase 4: 風控門檻掃描 ----
+    print("\n" + "=" * 78)
+    print("[Phase 4] 風控門檻掃描（MaxDrawdownRiskManager, rolling peak 90 天）on TEST")
+    print("=" * 78)
+    for max_dd in [None, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40]:
+        label = "無風控" if max_dd is None else f"{max_dd*100:.0f}%"
+        r = _trailing_backtest_target(test, period=43200, trail_period=14400, risk_pct=0.10,
+                                      max_dd_pct=max_dd, risk_window=129600)
+        print(f"  {label:>6}: sharpe={r['sharpe']:>6.2f}  ret={r['total_return_pct']:>7.1f}%  "
+              f"mdd={r['max_dd_pct']:>5.1f}%  trades={r['n_trades']:>3}  win={r['win_rate']*100:.0f}%")
 
     print("\n" + "=" * 78)
     print("Done")

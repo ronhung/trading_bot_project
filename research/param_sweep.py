@@ -318,24 +318,25 @@ def _backtest_target(
     from research.backtest import lightweight_backtest
     from research.triggers.turtle_breakout import TurtleBreakoutTrigger
     from research.labeling import TurtleExitLabeler
+    from execution.sizers import VolatilityTargetingSizer
 
     trigger = TurtleBreakoutTrigger(
         entry_period=entry_period, atr_period=atr_period,
         atr_mult=atr_mult, intensity_threshold=intensity_threshold, signed=True,
     )
     exit_labeler = TurtleExitLabeler(exit_period=exit_period, atr_period=atr_period, atr_mult=atr_mult)
+    sizer = position_sizer or VolatilityTargetingSizer(risk_pct=risk_pct, max_leverage=max_leverage)
     result = lightweight_backtest(
         raw_data,
         trigger=trigger,
         exit_labeler=exit_labeler,
+        position_sizer=sizer,
+        signal_strength=atr_mult,
+        risk_manager=risk_manager,
         indicator_params={"entry_period": entry_period, "exit_period": exit_period,
                           "atr_period": atr_period},
         initial_capital=cash,
-        risk_pct=risk_pct,
-        max_leverage=max_leverage,
         verbose=False,
-        position_sizer=position_sizer,
-        risk_manager=risk_manager,
     )
 
     return {
