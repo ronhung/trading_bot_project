@@ -39,7 +39,7 @@ def _trailing_backtest_target(raw_data, period=43200, trail_period=14400, risk_p
     trigger = AdamBreakoutTrigger(period=int(period), signed=True)
     exit_labeler = TrailingExitLabeler(trail_period=int(trail_period))
     if indicator_params is None:
-        indicator_params = {"exit_period": int(trail_period)}
+        indicator_params = {"entry_period": int(period), "exit_period": int(trail_period)}
     sizer = FixedRiskSizer(risk_pct=float(risk_pct), max_leverage=100.0)
     risk_manager = None
     if max_dd_pct is not None:

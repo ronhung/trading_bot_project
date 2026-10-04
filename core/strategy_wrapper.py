@@ -12,7 +12,6 @@ RESPONSIBILITY BOUNDARY:
 
 from enum import Enum, auto
 from typing import Optional, Dict, Any, List
-from collections import deque
 import logging
 
 import numpy as np
@@ -23,7 +22,7 @@ from core.trigger import BaseEventTrigger
 from core.feature import BaseFeature
 from core.position_sizer import BasePositionSizer
 from core.risk_manager import BaseRiskManager
-from research.features import add_indicators
+from research.features_incremental import IncrementalIndicators
 
 logger = logging.getLogger(__name__)
 
@@ -90,10 +89,9 @@ class StrategyWrapper:
         self._indicator_params = indicator_params or {}
 
         self._state: StrategyState = StrategyState.IDLE
-        # Cap the buffer to the largest indicator lookback (avoids unbounded
-        # growth + O(n^2) recompute on the live/backtest hot loop).
-        max_len = max(self._indicator_params.values()) + 1 if self._indicator_params else 1000
-        self._kline_buffer: deque = deque(maxlen=max_len)
+        # O(1) streaming indicators — replaces recomputing add_indicators over
+        # the whole lookback buffer on every bar (was O(n^2) total).
+        self._incremental = IncrementalIndicators(**self._indicator_params)
 
     # -- public API -------------------------------------------------------
 
@@ -116,9 +114,9 @@ class StrategyWrapper:
         Returns:
             OrderPayload if an entry should be placed, None otherwise.
         """
-        # --- Always keep the lookback buffer fresh (entry detection needs the
-        #     full history once a position closes) ---
-        self._kline_buffer.append(bar_data)
+        # --- Always update rolling indicators (even while WAITING_CLOSE) so the
+        #     lookback stays full-history once a position closes ---
+        row = self._incremental.update(bar_data)
 
         # --- Gate: waiting for C++ to close position ---
         if self._state == StrategyState.WAITING_CLOSE:
@@ -138,11 +136,8 @@ class StrategyWrapper:
             logger.debug("Risk limits blocked entry")
             return None
 
-        # --- Build DataFrame from the (already-updated) buffer ---
-        df = pd.DataFrame(self._kline_buffer)
-
-        # --- Indicators (single source of truth for feature + exit) ---
-        ind = add_indicators(df, **self._indicator_params)
+        # --- Single-bar indicator frame (same columns as add_indicators) ---
+        ind = pd.DataFrame([row])
 
         # --- Entry signal via injected trigger (pluggable) ---
         signal = int(self._trigger.generate_signals(ind).iloc[-1])
@@ -240,9 +235,9 @@ class StrategyWrapper:
         self._state = StrategyState.IDLE
 
     def reset(self) -> None:
-        """Reset state and clear buffer (e.g., for backtest restart)."""
+        """Reset state and clear indicator history (e.g., for backtest restart)."""
         self._state = StrategyState.IDLE
-        self._kline_buffer.clear()
+        self._incremental = IncrementalIndicators(**self._indicator_params)
 
     @classmethod
     def from_yaml(cls, config_path: str) -> "StrategyWrapper":

@@ -140,7 +140,8 @@ def test_reset_clears_state():
     wrapper._state = StrategyState.WAITING_CLOSE
     wrapper.reset()
     assert wrapper.state == StrategyState.IDLE
-    assert len(wrapper._kline_buffer) == 0
+    # Indicator history is re-initialized to a fresh rolling state.
+    assert wrapper._incremental._prev_close is None
 
 
 if __name__ == "__main__":

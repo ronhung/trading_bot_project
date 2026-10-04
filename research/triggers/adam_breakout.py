@@ -48,7 +48,12 @@ class AdamBreakoutTrigger(BaseEventTrigger):
             pd.Series with the same index as `data`.
             Values: 1 = long entry, -1 = short entry, 0 = no event.
         """
-        ind = add_indicators(data, entry_period=self.period)
+        # Reuse pre-computed entry_high/entry_low when the caller already ran
+        # add_indicators (the streaming StrategyWrapper and lightweight_backtest
+        # both do). Only recompute for raw OHLCV input.
+        if "entry_high" not in data.columns or "entry_low" not in data.columns:
+            data = add_indicators(data, entry_period=self.period)
+        ind = data
 
         close = ind["close"].values
         entry_high = ind["entry_high"].values
