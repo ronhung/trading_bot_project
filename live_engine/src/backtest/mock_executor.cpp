@@ -154,19 +154,25 @@ void MockExecutor::arm_trailing_exit(const std::string& indicator, int period) {
 }
 
 bool MockExecutor::check_and_execute_stop(const std::string& symbol) {
-    if (!risk_ || risk_->get_current_position() == 0.0) {
+    if (!risk_) {
         return false;
     }
-    double exit_price = 0.0;
-    std::string reason;
-    if (trailing_stop_.on_bar(current_bar_, exit_price, reason)) {
-        double pos = risk_->get_current_position();
-        std::string close_side = (pos > 0.0) ? "SELL" : "BUY";
-        std::cout << "🛑 [MockExecutor] " << reason << " hit @ " << exit_price << std::endl;
-        send_order(symbol, close_side, std::abs(pos), exit_price, true);
-        return true;
+    bool fired = false;
+    if (risk_->get_current_position() != 0.0) {
+        double exit_price = 0.0;
+        std::string reason;
+        if (trailing_stop_.on_bar(current_bar_, exit_price, reason)) {
+            double pos = risk_->get_current_position();
+            std::string close_side = (pos > 0.0) ? "SELL" : "BUY";
+            std::cout << "🛑 [MockExecutor] " << reason << " hit @ " << exit_price << std::endl;
+            send_order(symbol, close_side, std::abs(pos), exit_price, true);
+            fired = true;
+        }
     }
-    return false;
+    // Always feed the rolling window so the Donchian lookback stays full-history
+    // (matches the Python TrailingExitLabeler's .shift(1) semantics).
+    trailing_stop_.observe(current_bar_);
+    return fired;
 }
 
 void MockExecutor::export_trades_csv(const std::string& path) const {

@@ -1,4 +1,5 @@
 #include "binance_live_executor.h"
+#include "../core/risk_manager.h"
 #include <httplib.h>
 #include <openssl/hmac.h>
 #include <iostream>
@@ -183,6 +184,73 @@ bool BinanceLiveExecutor::send_order(const std::string& symbol,
                                      double price,
                                      bool reduce_only) {
     return place_order_internal(symbol, side, quantity, price, reduce_only, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Trailing exit (client-side, same TrailingStop class as the backtest engine)
+// ---------------------------------------------------------------------------
+void BinanceLiveExecutor::set_risk_manager(RiskManager* risk) {
+    risk_ = risk;
+}
+
+void BinanceLiveExecutor::arm_now_locked() {
+    // Assumes trailing_mtx_ is held.
+    if (!risk_ || trailing_stop_.active()) return;
+    double pos = risk_->get_current_position();
+    if (pos == 0.0) return;
+    int side = (pos > 0.0) ? 1 : -1;
+    double hard_stop = risk_->get_stop_price();
+    trailing_stop_.on_entry(side, hard_stop);
+}
+
+void BinanceLiveExecutor::arm_trailing_exit(const std::string& indicator, int period) {
+    // Called from the IpcServer receive thread right after the entry order is
+    // accepted. The exchange fill is async, so we may not have a position yet;
+    // configure now and let check_trailing_exit() arm lazily once filled.
+    std::lock_guard<std::mutex> lk(trailing_mtx_);
+    trailing_fired_ = false;
+    trailing_stop_.configure(indicator, period);
+    arm_now_locked();
+}
+
+void BinanceLiveExecutor::check_trailing_exit(const KLineData& bar) {
+    if (!risk_) return;
+
+    double pos = risk_->get_current_position();
+    bool fire = false;
+    double exit_price = 0.0;
+    std::string close_side;
+
+    {
+        std::lock_guard<std::mutex> lk(trailing_mtx_);
+
+        if (pos == 0.0) {
+            // Position cleared (exchange ACCOUNT_UPDATE) — disarm.
+            trailing_stop_.reset();
+            trailing_fired_ = false;
+        } else if (!trailing_fired_) {
+            // A close order is already in flight; do not re-arm on a stale position.
+            // Lazy-arm: position just filled after arm_trailing_exit().
+            arm_now_locked();
+
+            std::string reason;
+            if (trailing_stop_.on_bar(bar, exit_price, reason)) {
+                trailing_fired_ = true;
+                fire = true;
+                close_side = (pos > 0.0) ? "SELL" : "BUY";
+            }
+        }
+
+        // Always feed the rolling window so the Donchian lookback stays
+        // full-history (matches the Python TrailingExitLabeler .shift(1)).
+        trailing_stop_.observe(bar);
+    }
+
+    if (fire) {
+        std::cout << "🛑 [BinanceLiveExecutor] " << "trailing_stop"
+                  << " hit @ " << exit_price << std::endl;
+        send_order(bar.symbol, close_side, std::abs(pos), exit_price, true);
+    }
 }
 
 // ---------------------------------------------------------------------------

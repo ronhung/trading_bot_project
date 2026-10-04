@@ -8,7 +8,10 @@
 #include <chrono>
 #include <functional>
 #include "../core/i_order_executor.h"
+#include "../core/trailing_stop.h"
 #include "order_tracker.h"
+
+class RiskManager;
 
 class BinanceLiveExecutor : public IOrderExecutor {
 public:
@@ -24,6 +27,17 @@ public:
 
     void set_order_status_callback(std::function<void(const OrderStatusUpdate&)>) override;
     bool has_open_order() const override;
+
+    // Wire the shared RiskManager (position + stop price source for trailing exit).
+    void set_risk_manager(RiskManager* risk);
+
+    // Arm the client-side trailing exit for a just-opened position.
+    // Same TrailingStop class as the backtest MockExecutor.
+    void arm_trailing_exit(const std::string& indicator, int period) override;
+
+    // Per-bar trailing-exit check. Called from the main loop on each closed
+    // kline; fires a reduce-only close when the trailing stop is hit.
+    void check_trailing_exit(const KLineData& bar);
 
     // Initial state query (called once at startup)
     bool get_initial_state(double& out_usdt_balance, double& out_btcusdt_position);
@@ -84,6 +98,9 @@ private:
     // Fire status update through the callback
     void publish_status(const OrderStatusUpdate& u);
 
+    // Arm the trailing stop now if a position is filled (assumes trailing_mtx_ held).
+    void arm_now_locked();
+
     std::string api_key_;
     std::string secret_key_;
 
@@ -99,6 +116,12 @@ private:
 
     // Client order ID sequence
     std::atomic<uint64_t> cid_counter_{0};
+
+    // Trailing exit (client-side, shared TrailingStop class with backtest).
+    RiskManager* risk_ = nullptr;
+    TrailingStop trailing_stop_;
+    bool trailing_fired_ = false;   // close already submitted; wait for position to clear
+    std::mutex trailing_mtx_;       // guards trailing_stop_ across rx-thread vs main-loop
 
     static constexpr std::chrono::minutes kOrderTimeout{3};
     static constexpr int kMaxRepriceAttempts = 2;

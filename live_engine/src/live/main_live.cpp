@@ -63,6 +63,7 @@ int main() {
         IpcServer ipc(pub_port, pull_port, nullptr, &risk_manager, false);
 
         BinanceLiveExecutor executor(API_KEY, SECRET_KEY);
+        executor.set_risk_manager(&risk_manager);
         ipc.set_executor(&executor);  // wire the callback after executor exists
 
         double init_balance = 0.0;
@@ -203,6 +204,7 @@ int main() {
                 }
                 std::cout << "[Main] Closed kline close=" << current_kline.close
                           << " -> Python brain" << std::endl;
+                executor.check_trailing_exit(current_kline);
                 ipc.publish_kline(current_kline);
             }
         }

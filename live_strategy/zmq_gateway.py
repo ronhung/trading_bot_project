@@ -34,12 +34,18 @@ class BinanceZmqExecutionGateway(LiveExecutionGateway):
         entry execution + stop-loss + trailing exit autonomously.
         """
         payload_dict = order.to_dict()
-        # Use the existing send_order_signal interface for backward compat
+        # Use the existing send_order_signal interface for backward compat.
+        # The trailing exit spec MUST reach C++, otherwise it falls back to
+        # "none" and the bracket exit degenerates (immediate close for shorts).
         self._client.send_order_signal(
             action=order.action.value,
             symbol=order.symbol,
             price=order.entry_price,
             stop_price=order.hard_stop_loss,
+            trailing_exit={
+                "indicator": order.trailing_exit_indicator.value,
+                "period": order.trailing_exit_period,
+            },
         )
         print(
             f"  [Gateway] Sent {order.action.value} "

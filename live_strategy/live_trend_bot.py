@@ -108,6 +108,9 @@ class LiveTurtleBot:
             indicator_params=indicator_params,
             signal_threshold=signal_threshold,
             symbol=symbol,
+            # Backtest (--no-warmup) has synchronous fills and no POSITION_CLOSED
+            # message, so detect the close from the synced current_position.
+            sync_close_from_state=not warmup,
         )
 
         # Wire position_closed callback

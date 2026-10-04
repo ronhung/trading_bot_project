@@ -62,6 +62,7 @@ class StrategyWrapper:
         indicator_params: Optional[Dict[str, Any]] = None,
         signal_threshold: float = 0.0,
         symbol: str = "BTCUSDT",
+        sync_close_from_state: bool = False,
     ):
         """
         Args:
@@ -84,6 +85,7 @@ class StrategyWrapper:
         self._risk_manager = risk_manager
         self._signal_threshold = signal_threshold
         self._symbol = symbol
+        self._sync_close_from_state = sync_close_from_state
         self._bracket_exit = bracket_exit or BracketExit()
         self._indicator_params = indicator_params or {}
 
@@ -114,17 +116,29 @@ class StrategyWrapper:
         Returns:
             OrderPayload if an entry should be placed, None otherwise.
         """
+        # --- Always keep the lookback buffer fresh (entry detection needs the
+        #     full history once a position closes) ---
+        self._kline_buffer.append(bar_data)
+
         # --- Gate: waiting for C++ to close position ---
         if self._state == StrategyState.WAITING_CLOSE:
-            return None
+            # The backtest engine has no POSITION_CLOSED message; it syncs
+            # current_position into every kline. When sync_close_from_state is
+            # enabled (backtest only — fills are synchronous there), a zero
+            # position means the exit has fired and we can re-arm. Live keeps
+            # using on_position_closed() and must NOT use this (async fills).
+            if self._sync_close_from_state and portfolio_state.get("current_position", 0.0) == 0.0:
+                self._state = StrategyState.IDLE
+                logger.debug("Position closed (synced from C++); re-arming entries")
+            else:
+                return None
 
         # --- Gate: risk limits ---
         if not self._risk_manager.check_risk_limits(portfolio_state):
             logger.debug("Risk limits blocked entry")
             return None
 
-        # --- Build DataFrame from buffer + current bar ---
-        self._kline_buffer.append(bar_data)
+        # --- Build DataFrame from the (already-updated) buffer ---
         df = pd.DataFrame(self._kline_buffer)
 
         # --- Indicators (single source of truth for feature + exit) ---
@@ -185,13 +199,22 @@ class StrategyWrapper:
         )
 
         # --- Assemble OrderPayload ---
+        # The trailing indicator is side-specific: a long trails the Donchian
+        # low (exit when price < N-bar low), a short trails the Donchian high
+        # (exit when price > N-bar high). moving_average is side-agnostic.
+        trailing_indicator = self._bracket_exit.trailing_exit_indicator
+        if action == Action.SELL and trailing_indicator == TrailingExitIndicator.DONCHIAN_LOW:
+            trailing_indicator = TrailingExitIndicator.DONCHIAN_HIGH
+        elif action == Action.BUY and trailing_indicator == TrailingExitIndicator.DONCHIAN_HIGH:
+            trailing_indicator = TrailingExitIndicator.DONCHIAN_LOW
+
         order = OrderPayload(
             action=action,
             symbol=self._symbol,
             quantity=size,
             entry_price=close,
             hard_stop_loss=hard_stop if hard_stop is not None else 0.0,
-            trailing_exit_indicator=self._bracket_exit.trailing_exit_indicator,
+            trailing_exit_indicator=trailing_indicator,
             trailing_exit_period=self._bracket_exit.trailing_exit_period,
         )
 

@@ -6,26 +6,7 @@ void TrailingStop::configure(const std::string& indicator, int period) {
     period_ = period;
 }
 
-void TrailingStop::on_entry(int side, double hard_stop) {
-    side_ = side;
-    hard_stop_ = hard_stop;
-    lows_.clear();
-    highs_.clear();
-    closes_.clear();
-}
-
-void TrailingStop::reset() {
-    side_ = 0;
-    hard_stop_ = 0.0;
-    lows_.clear();
-    highs_.clear();
-    closes_.clear();
-}
-
-bool TrailingStop::on_bar(const KLineData& bar, double& exit_price, std::string& reason) {
-    if (side_ == 0) return false;
-
-    // Keep a rolling window of the last `period_` bars.
+void TrailingStop::observe(const KLineData& bar) {
     lows_.push_back(bar.low);
     highs_.push_back(bar.high);
     closes_.push_back(bar.close);
@@ -36,41 +17,62 @@ bool TrailingStop::on_bar(const KLineData& bar, double& exit_price, std::string&
             closes_.pop_front();
         }
     }
+}
 
-    // Compute the trailing level (if the rule is set).
-    double trailing = 0.0;
-    bool has_trailing = false;
+double TrailingStop::trailing_level() const {
     if (indicator_ == "donchian_low" && !lows_.empty()) {
-        trailing = *std::min_element(lows_.begin(), lows_.end());
-        has_trailing = true;
-    } else if (indicator_ == "donchian_high" && !highs_.empty()) {
-        trailing = *std::max_element(highs_.begin(), highs_.end());
-        has_trailing = true;
-    } else if (indicator_ == "moving_average" && !closes_.empty()) {
+        return *std::min_element(lows_.begin(), lows_.end());
+    }
+    if (indicator_ == "donchian_high" && !highs_.empty()) {
+        return *std::max_element(highs_.begin(), highs_.end());
+    }
+    if (indicator_ == "moving_average" && !closes_.empty()) {
         double sum = 0.0;
         for (double c : closes_) sum += c;
-        trailing = sum / static_cast<double>(closes_.size());
-        has_trailing = true;
+        return sum / static_cast<double>(closes_.size());
     }
+    return 0.0;
+}
+
+void TrailingStop::on_entry(int side, double hard_stop) {
+    side_ = side;
+    hard_stop_ = hard_stop;
+    extreme_ = hard_stop;  // running extreme starts at the initial stop level
+}
+
+void TrailingStop::reset() {
+    side_ = 0;
+    hard_stop_ = 0.0;
+    extreme_ = 0.0;
+    // NOTE: the rolling window is intentionally NOT cleared — it must persist
+    // across positions so the N-bar lookback stays full-history.
+}
+
+bool TrailingStop::on_bar(const KLineData& bar, double& exit_price, std::string& reason) {
+    if (side_ == 0) return false;
+
+    // Trailing level from the window of the previous N bars (observe() is
+    // called *after* this check, so the current bar is excluded).
+    double trailing = trailing_level();
 
     if (side_ > 0) {
-        double stop = hard_stop_;
-        if (has_trailing) stop = std::max(stop, trailing);  // trails up, never down
+        double stop = std::max(hard_stop_, extreme_);  // trails up, never down
         if (bar.low <= stop) {
             exit_price = std::min(bar.close, stop);
             reason = "trailing_stop";
             reset();
             return true;
         }
+        extreme_ = std::max(extreme_, trailing);
     } else {
-        double stop = hard_stop_;
-        if (has_trailing) stop = std::min(stop, trailing);  // trails down, never up
+        double stop = std::min(hard_stop_, extreme_);  // trails down, never up
         if (bar.high >= stop) {
             exit_price = std::max(bar.close, stop);
             reason = "trailing_stop";
             reset();
             return true;
         }
+        extreme_ = std::min(extreme_, trailing);
     }
     return false;
 }

@@ -39,7 +39,8 @@ class BinanceZmqClient:
         self.order_update_callback = callback
 
     # [added] dedicated function to send order signals
-    def send_order_signal(self, action: str, symbol: str, price: float, stop_price: float = 0.0):
+    def send_order_signal(self, action: str, symbol: str, price: float, stop_price: float = 0.0,
+                          trailing_exit: dict | None = None):
         """Package the strategy brain command into JSON and send it back to C++ at warp speed"""
         order_data = {
             "action": action,
@@ -48,6 +49,8 @@ class BinanceZmqClient:
             "stop_price": stop_price,
             "timestamp": datetime.now().timestamp()
         }
+        if trailing_exit is not None:
+            order_data["trailing_exit"] = trailing_exit
         self.commander.send_string(json.dumps(order_data))
         print(f"📤 [Comms] Sent {action} signal to the C++ execution engine")
 
