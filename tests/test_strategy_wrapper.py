@@ -9,7 +9,7 @@ if _PROJECT_ROOT not in sys.path:
 import numpy as np
 import pandas as pd
 
-from core.order_payload import TrailingExitIndicator
+from core.order_payload import BracketExit
 from core.strategy_wrapper import StrategyWrapper, StrategyState
 from execution.sizers import VolatilityTargetingSizer
 from execution.risk_managers import AllowAllRiskManager, MaxDrawdownRiskManager
@@ -60,8 +60,7 @@ def test_initial_state_is_idle():
         risk_manager=AllowAllRiskManager(),
         signal_threshold=0.0,
         symbol="BTCUSDT",
-        trailing_exit_indicator=TrailingExitIndicator.DONCHIAN_LOW,
-        trailing_exit_period=10,
+        bracket_exit=BracketExit(trailing_exit_period=10),
     )
     assert wrapper.state == StrategyState.IDLE
 
@@ -77,8 +76,7 @@ def test_on_position_closed_resets_to_idle():
         risk_manager=AllowAllRiskManager(),
         signal_threshold=0.0,
         symbol="BTCUSDT",
-        trailing_exit_indicator=TrailingExitIndicator.DONCHIAN_LOW,
-        trailing_exit_period=10,
+        bracket_exit=BracketExit(trailing_exit_period=10),
     )
     # Manually set to WAITING_CLOSE
     wrapper._state = StrategyState.WAITING_CLOSE
@@ -97,8 +95,7 @@ def test_risk_manager_blocks_entry():
         risk_manager=MaxDrawdownRiskManager(max_dd_pct=0.05),
         signal_threshold=0.0,
         symbol="BTCUSDT",
-        trailing_exit_indicator=TrailingExitIndicator.DONCHIAN_LOW,
-        trailing_exit_period=10,
+        bracket_exit=BracketExit(trailing_exit_period=10),
     )
     # Drawdown > 5% → blocked
     state = _make_portfolio_state(drawdown=0.10)
@@ -118,8 +115,7 @@ def test_waits_in_waiting_close():
         risk_manager=AllowAllRiskManager(),
         signal_threshold=0.0,
         symbol="BTCUSDT",
-        trailing_exit_indicator=TrailingExitIndicator.DONCHIAN_LOW,
-        trailing_exit_period=10,
+        bracket_exit=BracketExit(trailing_exit_period=10),
     )
     wrapper._state = StrategyState.WAITING_CLOSE
     bar = _make_synthetic_bar(close=50000.0, high=51000.0)  # would be breakout
@@ -139,8 +135,7 @@ def test_reset_clears_state():
         risk_manager=AllowAllRiskManager(),
         signal_threshold=0.0,
         symbol="BTCUSDT",
-        trailing_exit_indicator=TrailingExitIndicator.DONCHIAN_LOW,
-        trailing_exit_period=10,
+        bracket_exit=BracketExit(trailing_exit_period=10),
     )
     wrapper._state = StrategyState.WAITING_CLOSE
     wrapper.reset()

@@ -17,12 +17,12 @@ import logging
 import numpy as np
 import pandas as pd
 
-from core.order_payload import OrderPayload, Action, TrailingExitIndicator
+from core.order_payload import OrderPayload, Action, TrailingExitIndicator, BracketExit
 from core.trigger import BaseEventTrigger
 from core.feature import BaseFeature
 from core.position_sizer import BasePositionSizer
 from core.risk_manager import BaseRiskManager
-from shared.core_logic.turtle_math import calculate_turtle_signals
+from research.features import add_indicators
 
 logger = logging.getLogger(__name__)
 
@@ -57,32 +57,23 @@ class StrategyWrapper:
         feature_names: List[str],
         sizer: BasePositionSizer,
         risk_manager: BaseRiskManager,
+        bracket_exit: Optional[BracketExit] = None,
+        indicator_params: Optional[Dict[str, Any]] = None,
         signal_threshold: float = 0.0,
         symbol: str = "BTCUSDT",
-        trailing_exit_indicator: TrailingExitIndicator = TrailingExitIndicator.DONCHIAN_LOW,
-        trailing_exit_period: int = 14400,
-        entry_period: int = 20,
-        exit_period: int = 10,
-        atr_period: int = 20,
-        atr_mult: float = 2.0,
-        intensity_threshold: float = 0.0,
     ):
         """
         Args:
-            trigger: Event trigger for entry detection (research path).
+            trigger: Event trigger for entry detection (pluggable).
             feature: Feature computer for ML input vector.
             model: Trained ML model with .predict(X) method.
             feature_names: Ordered list of feature names matching model input.
             sizer: Position size calculator.
             risk_manager: Risk gate (False = block all entries).
+            bracket_exit: BracketExit exit spec (trailing rule + hard stop mode).
+            indicator_params: dict passed to add_indicators() for feature + exit.
             signal_threshold: Minimum model prediction to fire.
             symbol: Trading pair.
-            trailing_exit_indicator: Exit rule for C++ bracket order.
-            trailing_exit_period: Lookback bars for trailing exit.
-            entry_period, exit_period, atr_period, atr_mult,
-            intensity_threshold: Passed to calculate_turtle_signals()
-                (shared/core_logic/turtle_math.py) — the single source
-                of truth for execution-path signal generation.
         """
         self._trigger = trigger
         self._feature = feature
@@ -92,15 +83,8 @@ class StrategyWrapper:
         self._risk_manager = risk_manager
         self._signal_threshold = signal_threshold
         self._symbol = symbol
-        self._trailing_exit_indicator = trailing_exit_indicator
-        self._trailing_exit_period = trailing_exit_period
-
-        # Turtle params for shared brain (execution path)
-        self._entry_period = entry_period
-        self._exit_period = exit_period
-        self._atr_period = atr_period
-        self._atr_mult = atr_mult
-        self._intensity_threshold = intensity_threshold
+        self._bracket_exit = bracket_exit or BracketExit()
+        self._indicator_params = indicator_params or {}
 
         self._state: StrategyState = StrategyState.IDLE
         self._kline_buffer: List[Dict[str, Any]] = []
@@ -139,30 +123,18 @@ class StrategyWrapper:
         self._kline_buffer.append(bar_data)
         df = pd.DataFrame(self._kline_buffer)
 
-        # --- Compute entry signal via shared brain (single source of truth) ---
-        signal, stop_price = calculate_turtle_signals(
-            df,
-            self._entry_period,
-            self._exit_period,
-            self._atr_period,
-            self._atr_mult,
-            self._intensity_threshold,
-        )
+        # --- Indicators (single source of truth for feature + exit) ---
+        ind = add_indicators(df, **self._indicator_params)
 
-        if signal == 0 or stop_price is None:
-            return None  # no event at this bar
+        # --- Entry signal via injected trigger (pluggable) ---
+        signal = int(self._trigger.generate_signals(ind).iloc[-1])
+        if signal not in (1, -1):
+            return None  # no entry event at this bar
 
-        # Map turtle_math signal codes to Action
-        # 1=long entry, -1=short entry, 2=close long, -2=close short
-        if signal == 1:
-            action = Action.BUY
-        elif signal == -1:
-            action = Action.SELL
-        else:
-            return None  # exit signals (2, -2) not handled here — C++ manages exits
+        action = Action.BUY if signal == 1 else Action.SELL
 
         # --- Compute features at current bar ---
-        feat_dict = self._feature.compute_one(df, len(df) - 1)
+        feat_dict = self._feature.compute_one(ind, len(ind) - 1)
 
         # --- ML filter ---
         ml_score: float = 0.0
@@ -185,20 +157,28 @@ class StrategyWrapper:
         if atr_val <= 0:
             atr_val = 1.0  # defensive fallback
 
+        trailing_low = float(ind["exit_low"].iloc[-1]) if "exit_low" in ind.columns else None
+        trailing_high = float(ind["exit_high"].iloc[-1]) if "exit_high" in ind.columns else None
+
         equity = float(portfolio_state.get("available_balance", 0.0))
+        stop_dist = self._bracket_exit.stop_distance(
+            signal, close, atr_val, trailing_low, trailing_high
+        )
         size = self._sizer.calculate_size(
-            signal_strength=2.0,   # Turtle: ATR multiplier for stop
+            signal_strength=self._bracket_exit.atr_mult,
             current_atr=atr_val,
             account_equity=equity,
             entry_price=close,
+            stop_distance=stop_dist,
         )
         if size <= 0.0:
             logger.debug("Sizer returned zero size; skipping entry")
             return None
 
-        # --- Compute bracket exit parameters ---
-        # Use stop_price from calculate_turtle_signals() — the shared brain
-        hard_stop = stop_price
+        # --- Compute bracket exit parameters from the exit spec ---
+        hard_stop = self._bracket_exit.initial_stop(
+            signal, close, atr_val, trailing_low, trailing_high
+        )
 
         # --- Assemble OrderPayload ---
         order = OrderPayload(
@@ -206,9 +186,9 @@ class StrategyWrapper:
             symbol=self._symbol,
             quantity=size,
             entry_price=close,
-            hard_stop_loss=hard_stop,
-            trailing_exit_indicator=self._trailing_exit_indicator,
-            trailing_exit_period=self._trailing_exit_period,
+            hard_stop_loss=hard_stop if hard_stop is not None else 0.0,
+            trailing_exit_indicator=self._bracket_exit.trailing_exit_indicator,
+            trailing_exit_period=self._bracket_exit.trailing_exit_period,
         )
 
         # --- Transition to WAITING_CLOSE ---
@@ -300,6 +280,21 @@ class StrategyWrapper:
             "moving_average": TrailingExitIndicator.MOVING_AVERAGE,
         }
 
+        bracket_exit = BracketExit(
+            trailing_exit_indicator=trailing_map.get(
+                bracket_cfg.get("trailing_exit_indicator", "donchian_low"),
+                TrailingExitIndicator.DONCHIAN_LOW,
+            ),
+            trailing_exit_period=bracket_cfg.get("trailing_exit_period", 14400),
+            hard_stop_mode=bracket_cfg.get("hard_stop_mode", "donchian"),
+            atr_mult=cfg["trigger"]["params"].get("atr_mult", 2.0),
+        )
+        indicator_params = {
+            "entry_period": cfg["trigger"]["params"].get("entry_period", 20),
+            "exit_period": bracket_cfg.get("trailing_exit_period", 14400),
+            "atr_period": cfg["trigger"]["params"].get("atr_period", 20),
+        }
+
         return cls(
             trigger=trigger,
             feature=feature,
@@ -307,16 +302,8 @@ class StrategyWrapper:
             feature_names=feature_names,
             sizer=sizer,
             risk_manager=risk_manager,
+            bracket_exit=bracket_exit,
+            indicator_params=indicator_params,
             signal_threshold=model_cfg.get("threshold", 0.0),
             symbol=exec_cfg.get("symbol", "BTCUSDT"),
-            trailing_exit_indicator=trailing_map.get(
-                bracket_cfg.get("trailing_exit_indicator", "donchian_low"),
-                TrailingExitIndicator.DONCHIAN_LOW,
-            ),
-            trailing_exit_period=bracket_cfg.get("trailing_exit_period", 14400),
-            entry_period=cfg["trigger"]["params"].get("entry_period", 20),
-            exit_period=bracket_cfg.get("trailing_exit_period", 10),
-            atr_period=cfg["trigger"]["params"].get("atr_period", 20),
-            atr_mult=cfg["trigger"]["params"].get("atr_mult", 2.0),
-            intensity_threshold=cfg["trigger"]["params"].get("intensity_threshold", 0.0),
         )

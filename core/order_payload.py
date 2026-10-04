@@ -81,3 +81,61 @@ class OrderPayload:
         if self.take_profit is not None:
             d["take_profit"] = self.take_profit
         return d
+
+
+@dataclass(frozen=True)
+class BracketExit:
+    """
+    Exit spec — how the execution engine manages the exit lifecycle.
+
+    This is the pluggable "exit strategy" counterpart to BaseEventTrigger /
+    BasePositionSizer / BaseRiskManager. It captures the bracket-order
+    parameters that are serialized into the OrderPayload.
+
+    hard_stop_mode selects how the initial (hard) stop is computed:
+      "donchian" — the trailing Donchian channel's current level
+                   (pure trailing exit: no separate fixed stop)
+      "atr"      — entry ± atr_mult * ATR (fixed ATR stop)
+      "none"     — no hard stop (trailing only; sizing must use another source)
+    """
+
+    trailing_exit_indicator: TrailingExitIndicator = TrailingExitIndicator.DONCHIAN_LOW
+    trailing_exit_period: int = 14400
+    hard_stop_mode: str = "donchian"
+    atr_mult: float = 2.0
+
+    def initial_stop(
+        self,
+        side: int,
+        entry_price: float,
+        atr: float,
+        trailing_low: Optional[float] = None,
+        trailing_high: Optional[float] = None,
+    ) -> Optional[float]:
+        """
+        Compute the initial (hard) stop price for a side (+1 long / -1 short).
+
+        Returns None when hard_stop_mode="none".
+        """
+        if self.hard_stop_mode == "atr":
+            dist = self.atr_mult * max(atr, 1e-9)
+            return entry_price - dist if side > 0 else entry_price + dist
+        if self.hard_stop_mode == "donchian":
+            if side > 0:
+                return trailing_low
+            return trailing_high
+        return None
+
+    def stop_distance(
+        self,
+        side: int,
+        entry_price: float,
+        atr: float,
+        trailing_low: Optional[float] = None,
+        trailing_high: Optional[float] = None,
+    ) -> float:
+        """Risk distance (|entry - stop|) used for position sizing."""
+        stop = self.initial_stop(side, entry_price, atr, trailing_low, trailing_high)
+        if stop is not None:
+            return abs(entry_price - stop)
+        return self.atr_mult * max(atr, 1e-9)
