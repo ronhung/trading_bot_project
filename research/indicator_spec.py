@@ -37,6 +37,7 @@ ROLLING_SPEC: List[Dict[str, str]] = [
     {"name": "vol_mean",   "op": "mean", "input": "log_volume",     "period": "vol_period"},
     {"name": "vol_std",    "op": "std",  "input": "log_volume",     "period": "vol_period"},
     {"name": "ma",         "op": "mean", "input": "close",          "period": "ma_period"},
+    {"name": "close_std",  "op": "std",  "input": "close",          "period": "ma_period"},
     {"name": "taker_sum",  "op": "sum",  "input": "taker_buy_base", "period": "vol_period"},
     {"name": "vol_sum",    "op": "sum",  "input": "volume",         "period": "vol_period"},
 ]

@@ -89,6 +89,7 @@ class StrategyWrapper:
         self._indicator_params = indicator_params or {}
 
         self._state: StrategyState = StrategyState.IDLE
+        self._saw_position = False
         # O(1) streaming indicators — replaces recomputing add_indicators over
         # the whole lookback buffer on every bar (was O(n^2) total).
         self._incremental = IncrementalIndicators(**self._indicator_params)
@@ -119,14 +120,24 @@ class StrategyWrapper:
         row = self._incremental.update(bar_data)
 
         # --- Gate: waiting for C++ to close position ---
+        cur_pos = portfolio_state.get("current_position", 0.0)
         if self._state == StrategyState.WAITING_CLOSE:
             # The backtest engine has no POSITION_CLOSED message; it syncs
             # current_position into every kline. When sync_close_from_state is
             # enabled (backtest only — fills are synchronous there), a zero
             # position means the exit has fired and we can re-arm. Live keeps
             # using on_position_closed() and must NOT use this (async fills).
-            if self._sync_close_from_state and portfolio_state.get("current_position", 0.0) == 0.0:
+            #
+            # NOTE: the entry bar's kline is published BEFORE the fill, so it
+            # carries current_position==0. We must only re-arm after we have
+            # actually OBSERVED a non-zero position (a real open→closed
+            # transition), otherwise the brain re-enters on every bar while a
+            # position is open (duplicate orders).
+            if cur_pos != 0.0:
+                self._saw_position = True
+            if self._sync_close_from_state and self._saw_position and cur_pos == 0.0:
                 self._state = StrategyState.IDLE
+                self._saw_position = False
                 logger.debug("Position closed (synced from C++); re-arming entries")
             else:
                 return None
@@ -136,17 +147,21 @@ class StrategyWrapper:
             logger.debug("Risk limits blocked entry")
             return None
 
-        # --- Single-bar indicator frame (same columns as add_indicators) ---
-        ind = pd.DataFrame([row])
-
         # --- Entry signal via injected trigger (pluggable) ---
-        signal = int(self._trigger.generate_signals(ind).iloc[-1])
+        # Pass the raw indicator dict to avoid building a DataFrame on every bar
+        # (a ~0.5ms pandas overhead that dominates the streaming hot loop).
+        signal = self._trigger.generate_signals(row)
+        if isinstance(signal, pd.Series):
+            signal = int(signal.iloc[-1])
+        else:
+            signal = int(signal)
         if signal not in (1, -1):
             return None  # no entry event at this bar
 
         action = Action.BUY if signal == 1 else Action.SELL
 
-        # --- Compute features at current bar ---
+        # --- Compute features at current bar (only on entry events) ---
+        ind = pd.DataFrame([row])
         feat_dict = self._feature.compute_one(ind, len(ind) - 1)
 
         # --- ML filter ---
@@ -156,7 +171,11 @@ class StrategyWrapper:
                 [[feat_dict.get(name, 0.0) for name in self._feature_names]],
                 dtype=np.float32,
             )
-            ml_score = float(self._model.predict(feature_vec)[0])
+            if hasattr(self._model, "predict_proba"):
+                # classifier: score = P(win); filter keeps only high-prob entries
+                ml_score = float(self._model.predict_proba(feature_vec)[0][1])
+            else:
+                ml_score = float(self._model.predict(feature_vec)[0])
             if ml_score <= self._signal_threshold:
                 logger.debug(
                     "ML filter suppressed %s: pred=%.4f <= threshold=%.2f",
@@ -237,6 +256,7 @@ class StrategyWrapper:
     def reset(self) -> None:
         """Reset state and clear indicator history (e.g., for backtest restart)."""
         self._state = StrategyState.IDLE
+        self._saw_position = False
         self._incremental = IncrementalIndicators(**self._indicator_params)
 
     @classmethod

@@ -381,6 +381,27 @@ class TrendFilterFeature(BaseFeature):
         return feature_trend_filter(data, idx)
 
 
+def feature_bollinger_zscore(df: pd.DataFrame, idx: int) -> Dict[str, float]:
+    """Distance from the Bollinger mean in std units — the mean-reversion signal."""
+    close = df["close"].iloc[idx]
+    ma_val = _safe_loc(df, idx, "ma")
+    std_val = _safe_loc(df, idx, "close_std")
+    if pd.isna(ma_val) or pd.isna(std_val) or std_val <= 0:
+        return {"bollinger_zscore": 0.0, "bollinger_zscore_abs": 0.0}
+    z = (close - ma_val) / std_val
+    return {"bollinger_zscore": float(z), "bollinger_zscore_abs": float(abs(z))}
+
+
+class BollingerZScoreFeature(BaseFeature):
+    """Z-score distance from the Bollinger mean (mean-reversion context)."""
+
+    def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        return _CallableFeature(feature_bollinger_zscore, "bollinger_zscore").compute(data, events)
+
+    def compute_one(self, data: pd.DataFrame, idx: int) -> Dict[str, float]:
+        return feature_bollinger_zscore(data, idx)
+
+
 class CompositeFeature(BaseFeature):
     """Combine multiple BaseFeature instances into one."""
 
@@ -406,6 +427,23 @@ def default_feature_set() -> CompositeFeature:
         VolumeRatioFeature(),
         ChannelPositionFeature(),
         DonchianWidthFeature(),
+        LaggedReturnsFeature(),
+        TakerFlowFeature(),
+        TrendFilterFeature(),
+    ])
+
+
+def mean_reversion_feature_set() -> CompositeFeature:
+    """Mean-reversion feature set: z-score distance + volatility + momentum.
+
+    Drops the breakout-oriented features (intensity / Donchian position) that
+    are anti-correlated with mean-reversion outcomes, and adds the Bollinger
+    z-score (how oversold/overbought is the entry).
+    """
+    return CompositeFeature([
+        BollingerZScoreFeature(),
+        ATRFeature(),
+        VolumeRatioFeature(),
         LaggedReturnsFeature(),
         TakerFlowFeature(),
         TrendFilterFeature(),

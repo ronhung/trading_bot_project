@@ -26,6 +26,7 @@ from execution.sizers import FixedRiskSizer
 from execution.risk_managers import MaxDrawdownRiskManager
 from research.features import default_feature_set
 from research.triggers.adam_breakout import AdamBreakoutTrigger
+from research.triggers.trend_breakout import TrendFilteredBreakoutTrigger
 from live_strategy.zmq_feeder import BinanceZmqDataFeeder
 from live_strategy.zmq_gateway import BinanceZmqExecutionGateway
 
@@ -53,6 +54,9 @@ class LiveTurtleBot:
         model_path: str | None = None,
         feature_list_path: str | None = None,
         signal_threshold: float = 0.0,
+        trigger_type: str = "adam",
+        trend_period: int | None = None,
+        classifier: bool = False,
     ):
         self.symbol = symbol
 
@@ -68,7 +72,12 @@ class LiveTurtleBot:
         self.gateway = BinanceZmqExecutionGateway(self.feeder.client)
 
         # -- Strategy components (DI — swap objects to change strategy) --
-        trigger = AdamBreakoutTrigger(period=period)
+        if trigger_type == "trend_breakout":
+            tp = trend_period or period * 4
+            trigger = TrendFilteredBreakoutTrigger(entry_period=period, trend_period=tp)
+        else:
+            trigger = AdamBreakoutTrigger(period=period)
+
         features = default_feature_set()
         sizer = FixedRiskSizer(risk_pct=risk_pct, max_leverage=max_leverage)
         risk_manager = MaxDrawdownRiskManager(max_dd_pct=max_dd_pct)
@@ -83,13 +92,18 @@ class LiveTurtleBot:
             "exit_period": trail_period,
             "atr_period": period,
         }
+        if trigger_type == "trend_breakout":
+            indicator_params["ma_period"] = trend_period or period * 4
 
         # -- ML model (optional) --
         model = None
         feature_names: list = []
         if model_path is not None and feature_list_path is not None:
             import xgboost as xgb
-            model = xgb.XGBRegressor()
+            if classifier:
+                model = xgb.XGBClassifier()
+            else:
+                model = xgb.XGBRegressor()
             model.load_model(model_path)
             with open(feature_list_path, "r") as f:
                 feature_names = json.load(f)
@@ -173,12 +187,24 @@ if __name__ == "__main__":
         "--threshold", type=float, default=0.0,
         help="ML signal threshold",
     )
+    parser.add_argument(
+        "--trigger", type=str, default="adam",
+        help="Trigger type: adam | trend_breakout",
+    )
+    parser.add_argument(
+        "--trend-period", type=int, default=None,
+        help="Trend MA filter period for trend_breakout trigger (default 4x period)",
+    )
+    parser.add_argument(
+        "--classifier", action="store_true",
+        help="Load the ML model as an XGBClassifier (predict_proba)",
+    )
     args = parser.parse_args()
 
     print("=" * 50)
-    print("Adam Trailing Trading Bot")
+    print("Trend Trailing Trading Bot")
     print(f"  Symbol: BTCUSDT")
-    print(f"  Params: period={args.period}, trail={args.trail_period}, "
+    print(f"  Params: trigger={args.trigger}, period={args.period}, trail={args.trail_period}, "
           f"hard_stop={args.hard_stop_mode}, risk_pct={args.risk_pct}")
     print("=" * 50)
 
@@ -192,5 +218,8 @@ if __name__ == "__main__":
         model_path=args.model,
         feature_list_path=args.features,
         signal_threshold=args.threshold,
+        trigger_type=args.trigger,
+        trend_period=args.trend_period,
+        classifier=args.classifier,
     )
     bot.start()

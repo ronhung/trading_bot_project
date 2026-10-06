@@ -778,6 +778,85 @@ class TrailingExitLabeler(BaseLabeler):
         return out
 
 
+class MeanReversionLabeler(BaseLabeler):
+    """
+    Mean-reversion exit (Bollinger): enter below the lower band, exit when
+    price reverts back to the entry-time mean (upper), stop out one band lower,
+    or time out after max_hold bars.
+
+    Long-only (events are 1/0). Mirrors the C++ "revert-to-mean" exit.
+    """
+
+    def __init__(self, period: int = 120, num_std: float = 2.0, max_hold: int = 240):
+        self.period = period
+        self.num_std = num_std
+        self.max_hold = max_hold
+
+    def compute_labels(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
+        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_indices = np.flatnonzero(event_mask.values)
+        cols = ["label", "barrier_hit", "exit_idx", "n_bars_held",
+                "entry_price", "exit_price", "stop_distance", "actual_return", "r_multiple"]
+        if len(event_indices) == 0:
+            return pd.DataFrame(columns=cols)
+
+        close = data["close"].values
+        ma = data["close"].rolling(self.period).mean().shift(1).values
+        std = data["close"].rolling(self.period).std(ddof=0).shift(1).values
+        n = len(close)
+
+        exit_idx_list, exit_price_list, reason_list, n_bars_list, stop_dist_list, r_mult_list = [], [], [], [], [], []
+
+        for ev in event_indices:
+            entry = close[ev]
+            band = self.num_std * std[ev]            # risk = one band width
+            target = ma[ev]                          # reversion target (entry-time mean)
+            stop = entry - band                      # stop one band below entry
+            exit_idx = None
+            reason = "timeout"
+            end = min(ev + self.max_hold, n - 1)
+            for t in range(ev + 1, end + 1):
+                if close[t] >= target:
+                    exit_idx = t
+                    reason = "upper"
+                    break
+                if close[t] <= stop:
+                    exit_idx = t
+                    reason = "lower"
+                    break
+            if exit_idx is None:
+                exit_idx = end
+                reason = "timeout"
+
+            exit_price = close[exit_idx]
+            r_mult = (exit_price - entry) / band if band > 0 else 0.0
+            exit_idx_list.append(exit_idx)
+            exit_price_list.append(exit_price)
+            reason_list.append(reason)
+            n_bars_list.append(exit_idx - ev)
+            stop_dist_list.append(band)
+            r_mult_list.append(r_mult)
+
+        entry_prices = close[event_indices]
+        exit_prices = np.asarray(exit_price_list, dtype=float)
+        actual_return = np.log(exit_prices / entry_prices)  # long-only side
+        label = np.where(actual_return > 0, 1, np.where(actual_return < 0, -1, 0))
+
+        out = pd.DataFrame({
+            "label": label,
+            "barrier_hit": np.asarray(reason_list, dtype=object),
+            "exit_idx": np.asarray(exit_idx_list, dtype=int),
+            "n_bars_held": np.asarray(n_bars_list, dtype=int),
+            "entry_price": entry_prices,
+            "exit_price": exit_prices,
+            "stop_distance": np.asarray(stop_dist_list, dtype=float),
+            "actual_return": actual_return,
+            "r_multiple": np.asarray(r_mult_list, dtype=float),
+        }, index=event_indices)
+        out.index.name = "event_idx"
+        return out
+
+
 # ============================================================
 # __main__ self-test
 # ============================================================

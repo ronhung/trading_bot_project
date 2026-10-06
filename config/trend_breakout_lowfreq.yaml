@@ -1,0 +1,50 @@
+# ================================================================
+# Trend-Filtered Breakout — LOW frequency (~2 trades/month)
+# ================================================================
+# Phase 1: TrendFilteredBreakoutTrigger — 5-day Donchian breakout gated
+#          by a 20-day trend MA (long-only)
+# Phase 2: 8 default features + TrailingExitLabeler
+# Phase 3: no ML filter — the low-freq trigger already carries the edge,
+#          and the event count is too small for a useful classifier.
+# Full-data (2020-2026) reference: Sharpe 1.33, +96%, DD 11%, 176 trades
+# ================================================================
+
+strategy:
+  name: "trend_breakout_lowfreq"
+  version: "1.0"
+
+data:
+  source: "data/historical_data/BTCUSDT_1m_full.parquet"
+  train_range: ["2020-01-01", "2024-01-01"]
+  test_range:  ["2024-01-01", "2026-10-03"]
+
+trigger:
+  type: "research.triggers.trend_breakout.TrendFilteredBreakoutTrigger"
+  params:
+    entry_period: 7200   # 5-day breakout at 1m
+    trend_period: 28800  # 20-day trend MA filter
+    long_only: true
+
+indicators:
+  entry_period: 7200
+  exit_period: 3600      # 2.5-day trailing exit
+  atr_period: 7200
+  vol_period: 1440
+  ma_period: 28800
+
+features:
+  - type: "research.features.ATRFeature"
+  - type: "research.features.BreakoutIntensityFeature"
+  - type: "research.features.VolumeRatioFeature"
+  - type: "research.features.ChannelPositionFeature"
+  - type: "research.features.DonchianWidthFeature"
+  - type: "research.features.LaggedReturnsFeature"
+  - type: "research.features.TakerFlowFeature"
+  - type: "research.features.TrendFilterFeature"
+
+labeler:
+  type: "research.labeling.TrailingExitLabeler"
+  params:
+    trail_period: 3600
+
+# model: intentionally omitted — ML doesn't add value at low frequency.

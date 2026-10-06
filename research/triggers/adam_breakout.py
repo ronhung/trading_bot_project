@@ -36,18 +36,30 @@ class AdamBreakoutTrigger(BaseEventTrigger):
         self.period = period
         self.signed = signed
 
-    def generate_signals(self, data: pd.DataFrame) -> pd.Series:
+    def generate_signals(self, data):
         """
         Scan for breakouts of the prior `period`-bar high/low.
 
         Args:
-            data: OHLCV DataFrame sorted chronologically (oldest first).
-                  Must contain at minimum: high, low, close.
+            data: OHLCV DataFrame sorted chronologically (oldest first) — or a
+                  single-bar dict of precomputed indicators (streaming path).
 
         Returns:
-            pd.Series with the same index as `data`.
+            pd.Series with the same index as `data` (DataFrame input) or a
+            scalar int (dict input).
             Values: 1 = long entry, -1 = short entry, 0 = no event.
         """
+        # Streaming path: a single-bar dict of precomputed indicators -> scalar.
+        if isinstance(data, dict):
+            close = data["close"]
+            entry_high = data.get("entry_high", np.nan)
+            entry_low = data.get("entry_low", np.nan)
+            long_e = (close > entry_high) and not np.isnan(entry_high)
+            short_e = (close < entry_low) and not np.isnan(entry_low)
+            if self.signed:
+                return 1 if long_e else (-1 if short_e else 0)
+            return 1 if (long_e or short_e) else 0
+
         # Reuse pre-computed entry_high/entry_low when the caller already ran
         # add_indicators (the streaming StrategyWrapper and lightweight_backtest
         # both do). Only recompute for raw OHLCV input.

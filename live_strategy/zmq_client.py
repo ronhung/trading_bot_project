@@ -73,6 +73,10 @@ class BinanceZmqClient:
                     self.order_update_callback(data)
         except KeyboardInterrupt:
             print("\n🛑 [ZMQ Client] Listening stopped.")
+        except Exception as e:
+            import traceback
+            print("🔥 [ZMQ Client] FATAL in start_listening:")
+            traceback.print_exc()
         finally:
             self.close()
 
