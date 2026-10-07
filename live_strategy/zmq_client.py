@@ -23,6 +23,11 @@ class BinanceZmqClient:
         sub_address = f"tcp://{self.host}:{self.sub_port}"
         self.subscriber.connect(sub_address)
         self.subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
+        # Non-blocking receive window (ms). Without this, recv_string() blocks
+        # indefinitely and defers Ctrl+C until the next kline arrives (up to 1
+        # minute). With a short timeout the loop wakes up often, so KeyboardInterrupt
+        # is honored immediately and the process exits cleanly.
+        self.subscriber.setsockopt(zmq.RCVTIMEO, 200)
         
         # connect the sender
         push_address = f"tcp://{self.host}:{self.push_port}"
@@ -62,7 +67,12 @@ class BinanceZmqClient:
         self.is_running = True
         try:
             while self.is_running:
-                message = self.subscriber.recv_string()
+                try:
+                    message = self.subscriber.recv_string()
+                except zmq.Again:
+                    # RCVTIMEO fired with no message — loop back so we keep
+                    # checking is_running and can honor Ctrl+C promptly.
+                    continue
                 data = json.loads(message)
                 mtype = data.get("type")
                 if mtype == "kline" and self.kline_callback:
@@ -79,6 +89,10 @@ class BinanceZmqClient:
             traceback.print_exc()
         finally:
             self.close()
+
+    def stop(self):
+        """Request a clean shutdown of the listen loop (interrupts a pending recv)."""
+        self.is_running = False
 
     def close(self):
         self.subscriber.close()
