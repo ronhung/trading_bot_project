@@ -77,6 +77,7 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
             host=host, sub_port=sub_port, push_port=push_port,
         )
         self._on_bar_callback: Optional[Callable] = None
+        self._kline_count = 0
 
     # -- LiveDataFeeder interface -------------------------------------------
 
@@ -163,6 +164,19 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
         if data.get("is_closed") is True:
             kline = self._kline_from_zmq(data)
             self.kline_buffer.append(kline)
+
+            # Live only: print each closed bar (~1/min) so you can confirm kline
+            # data is flowing. Backtest (--no-warmup) skips this to avoid slowing
+            # the 3.5M-bar replay with stdout flushes.
+            if self._do_warmup:
+                self._kline_count += 1
+                ts = datetime.fromtimestamp(kline["close_time"] / 1000.0).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                print(
+                    f"📈 [Feeder] #{self._kline_count} kline @ {ts} "
+                    f"close={kline['close']:.2f} vol={kline['volume']:.1f}"
+                )
 
             if self._on_bar_callback is not None:
                 portfolio_state = {
