@@ -77,6 +77,7 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
             host=host, sub_port=sub_port, push_port=push_port,
         )
         self._on_bar_callback: Optional[Callable] = None
+        self._on_order_update_cb: Optional[Callable] = None
         self._kline_count = 0
 
     # -- LiveDataFeeder interface -------------------------------------------
@@ -96,6 +97,10 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
         """
         self._on_bar_callback = on_bar_callback
         self._client.start_listening()
+
+    def set_order_update_callback(self, callback: Callable) -> None:
+        """Forward order status updates (FILLED / CANCELED / ...) to the brain."""
+        self._on_order_update_cb = callback
 
     # -- Warmup -------------------------------------------------------------
 
@@ -206,10 +211,14 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
         cid = data.get("client_order_id", "?")
         side = data.get("side", "?")
         qty = data.get("quantity", 0)
+        filled = data.get("filled_quantity", 0)
         px = data.get("price", 0)
         reason = data.get("reason", "")
         extra = f" reason={reason}" if reason else ""
-        print(f"  [Order] {cid}: {status} {side} qty={qty} @ {px}{extra}")
+        print(f"  [Order] {cid}: {status} {side} qty={qty} filled={filled} @ {px}{extra}")
+
+        if self._on_order_update_cb is not None:
+            self._on_order_update_cb(data)
 
     # -- Kline parsing (moved verbatim from LiveTurtleBot) ------------------
 

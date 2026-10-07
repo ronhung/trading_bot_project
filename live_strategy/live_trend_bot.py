@@ -15,12 +15,19 @@ import json
 import os
 import sys
 
+import yaml
+
 # Project root for cross-package imports
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from core.order_payload import TrailingExitIndicator, BracketExit
+from core.execution_spec import (
+    ExecutionSpec,
+    DEFAULT_ENTRY_EXECUTION,
+    DEFAULT_EXIT_EXECUTION,
+)
 from core.strategy_wrapper import StrategyWrapper
 from execution.sizers import FixedRiskSizer
 from execution.risk_managers import MaxDrawdownRiskManager
@@ -57,6 +64,8 @@ class LiveTurtleBot:
         trigger_type: str = "adam",
         trend_period: int | None = None,
         classifier: bool = False,
+        entry_execution: ExecutionSpec | None = None,
+        exit_execution: ExecutionSpec | None = None,
     ):
         self.symbol = symbol
         self.warmup = warmup
@@ -128,6 +137,8 @@ class LiveTurtleBot:
             indicator_params=indicator_params,
             signal_threshold=signal_threshold,
             symbol=symbol,
+            entry_execution=entry_execution,
+            exit_execution=exit_execution,
             # Detect the close from the synced current_position (both backtest
             # and live). StrategyWrapper._saw_position makes this safe for live's
             # async fills: it only re-arms after a real open->closed transition.
@@ -138,6 +149,9 @@ class LiveTurtleBot:
         self.gateway.set_position_closed_callback(
             self.strategy.on_position_closed
         )
+        # Wire order status updates so an abandoned (never-filled) entry resets
+        # the brain from WAITING_CLOSE back to IDLE.
+        self.feeder.set_order_update_callback(self.strategy.on_order_update)
 
     def start(self) -> None:
         """Connect and begin the event loop."""
@@ -160,8 +174,76 @@ class LiveTurtleBot:
             self.gateway.send_order(order)
 
 
+def _bot_kwargs_from_yaml(path: str) -> dict:
+    """Map a research strategy YAML (config/*.yaml) into LiveTurtleBot kwargs.
+
+    This is the "one file per strategy" bridge: trigger + indicators + model +
+    execution are read from the same YAML the research pipeline uses, so running
+    the live/backtest engine needs only `--config <path>`.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    trig = cfg.get("trigger", {})
+    trig_type = trig.get("type", "")
+    params = trig.get("params", {})
+
+    trigger_type = "trend_breakout" if "trend_breakout" in trig_type else "adam"
+    period = int(params.get("entry_period", 43200))
+    trend_period = params.get("trend_period")  # None for adam
+
+    # Exit lookback: labeler.trail_period (authoritative), else indicators.exit_period.
+    labeler = cfg.get("labeler", {})
+    trail_period = labeler.get("params", {}).get("trail_period")
+    if not trail_period:
+        trail_period = cfg.get("indicators", {}).get("exit_period")
+    trail_period = int(trail_period or (period // 2))
+
+    # Optional ML filter. The model path is derived from output_prefix — the
+    # pipeline saves research/outputs/<prefix>_{model,features}.json.
+    model_cfg = cfg.get("model") or {}
+    prefix = model_cfg.get("output_prefix")
+    model_path = feature_list_path = None
+    classifier = False
+    threshold = 0.0
+    if prefix:
+        model_path = f"research/outputs/{prefix}_model.json"
+        feature_list_path = f"research/outputs/{prefix}_features.json"
+        classifier = (model_cfg.get("type") == "xgboost_classifier")
+        threshold = float(model_cfg.get("threshold", 0.5 if classifier else 0.0))
+
+    # Execution spec (entry + exit). Falls back to the aggressive defaults.
+    exec_cfg = cfg.get("execution", {})
+    entry_execution = (
+        ExecutionSpec.from_dict(exec_cfg["entry"]) if exec_cfg.get("entry")
+        else DEFAULT_ENTRY_EXECUTION
+    )
+    exit_execution = (
+        ExecutionSpec.from_dict(exec_cfg["exit"]) if exec_cfg.get("exit")
+        else DEFAULT_EXIT_EXECUTION
+    )
+
+    return {
+        "period": period,
+        "trail_period": trail_period,
+        "trigger_type": trigger_type,
+        "trend_period": trend_period,
+        "model_path": model_path,
+        "feature_list_path": feature_list_path,
+        "signal_threshold": threshold,
+        "classifier": classifier,
+        "entry_execution": entry_execution,
+        "exit_execution": exit_execution,
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Adam Trailing Trading Bot")
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to a strategy YAML (config/*.yaml). Reads trigger + model + "
+             "execution in one place; overrides the individual flags below.",
+    )
     parser.add_argument(
         "--no-warmup", action="store_true",
         help="Skip REST warmup (use in C++ backtest mode)",
@@ -210,27 +292,69 @@ if __name__ == "__main__":
         "--classifier", action="store_true",
         help="Load the ML model as an XGBClassifier (predict_proba)",
     )
+    parser.add_argument("--exec-entry-order", type=str, default="market",
+                        help="Entry order type: market | limit | limit_maker")
+    parser.add_argument("--exec-entry-unfilled", type=str, default="cancel",
+                        help="Entry unfilled policy: cancel | reprice | market")
+    parser.add_argument("--exec-entry-timeout-ms", type=int, default=0,
+                        help="Entry unfilled timeout (ms; 0 = never chase)")
+    parser.add_argument("--exec-exit-order", type=str, default="market",
+                        help="Exit order type: market | limit | limit_maker")
+    parser.add_argument("--exec-exit-unfilled", type=str, default="market",
+                        help="Exit unfilled policy: cancel | reprice | market")
+    parser.add_argument("--exec-exit-timeout-ms", type=int, default=3000,
+                        help="Exit unfilled timeout (ms)")
     args = parser.parse_args()
 
-    print("=" * 50)
-    print("Trend Trailing Trading Bot")
-    print(f"  Symbol: BTCUSDT")
-    print(f"  Params: trigger={args.trigger}, period={args.period}, trail={args.trail_period}, "
-          f"hard_stop={args.hard_stop_mode}, risk_pct={args.risk_pct}")
-    print("=" * 50)
-
-    bot = LiveTurtleBot(
-        period=args.period,
-        trail_period=args.trail_period,
-        hard_stop_mode=args.hard_stop_mode,
-        atr_mult=args.atr_mult,
-        risk_pct=args.risk_pct,
-        warmup=not args.no_warmup,
-        model_path=args.model,
-        feature_list_path=args.features,
-        signal_threshold=args.threshold,
-        trigger_type=args.trigger,
-        trend_period=args.trend_period,
-        classifier=args.classifier,
-    )
+    if args.config:
+        kw = _bot_kwargs_from_yaml(args.config)
+        entry_execution = kw.pop("entry_execution")
+        exit_execution = kw.pop("exit_execution")
+        print("=" * 50)
+        print("Trend Trailing Trading Bot")
+        print(f"  Config: {args.config}")
+        print(f"  Params: trigger={kw['trigger_type']}, period={kw['period']}, "
+              f"trail={kw['trail_period']}, trend={kw['trend_period']}")
+        print(f"  Entry exec: {entry_execution.to_dict()}")
+        print(f"  Exit  exec: {exit_execution.to_dict()}")
+        print("=" * 50)
+        bot = LiveTurtleBot(
+            warmup=not args.no_warmup,
+            entry_execution=entry_execution,
+            exit_execution=exit_execution,
+            **kw,
+        )
+    else:
+        entry_execution = ExecutionSpec.from_dict({
+            "order_type": args.exec_entry_order,
+            "unfilled_policy": args.exec_entry_unfilled,
+            "timeout_ms": args.exec_entry_timeout_ms,
+        })
+        exit_execution = ExecutionSpec.from_dict({
+            "order_type": args.exec_exit_order,
+            "unfilled_policy": args.exec_exit_unfilled,
+            "timeout_ms": args.exec_exit_timeout_ms,
+        })
+        print("=" * 50)
+        print("Trend Trailing Trading Bot")
+        print(f"  Symbol: BTCUSDT")
+        print(f"  Params: trigger={args.trigger}, period={args.period}, trail={args.trail_period}, "
+              f"hard_stop={args.hard_stop_mode}, risk_pct={args.risk_pct}")
+        print("=" * 50)
+        bot = LiveTurtleBot(
+            period=args.period,
+            trail_period=args.trail_period,
+            hard_stop_mode=args.hard_stop_mode,
+            atr_mult=args.atr_mult,
+            risk_pct=args.risk_pct,
+            warmup=not args.no_warmup,
+            model_path=args.model,
+            feature_list_path=args.features,
+            signal_threshold=args.threshold,
+            trigger_type=args.trigger,
+            trend_period=args.trend_period,
+            classifier=args.classifier,
+            entry_execution=entry_execution,
+            exit_execution=exit_execution,
+        )
     bot.start()

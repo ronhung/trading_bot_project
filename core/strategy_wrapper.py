@@ -18,6 +18,11 @@ import numpy as np
 import pandas as pd
 
 from core.order_payload import OrderPayload, Action, TrailingExitIndicator, BracketExit
+from core.execution_spec import (
+    ExecutionSpec,
+    DEFAULT_ENTRY_EXECUTION,
+    DEFAULT_EXIT_EXECUTION,
+)
 from core.trigger import BaseEventTrigger
 from core.feature import BaseFeature
 from core.position_sizer import BasePositionSizer
@@ -62,6 +67,8 @@ class StrategyWrapper:
         signal_threshold: float = 0.0,
         symbol: str = "BTCUSDT",
         sync_close_from_state: bool = False,
+        entry_execution: Optional[ExecutionSpec] = None,
+        exit_execution: Optional[ExecutionSpec] = None,
     ):
         """
         Args:
@@ -90,6 +97,9 @@ class StrategyWrapper:
 
         self._state: StrategyState = StrategyState.IDLE
         self._saw_position = False
+        # How this strategy's orders are placed + how unfilled orders are handled.
+        self._entry_execution = entry_execution or DEFAULT_ENTRY_EXECUTION
+        self._exit_execution = exit_execution or DEFAULT_EXIT_EXECUTION
         # O(1) streaming indicators — replaces recomputing add_indicators over
         # the whole lookback buffer on every bar (was O(n^2) total).
         self._incremental = IncrementalIndicators(**self._indicator_params)
@@ -230,6 +240,8 @@ class StrategyWrapper:
             hard_stop_loss=hard_stop if hard_stop is not None else 0.0,
             trailing_exit_indicator=trailing_indicator,
             trailing_exit_period=self._bracket_exit.trailing_exit_period,
+            entry_execution=self._entry_execution,
+            exit_execution=self._exit_execution,
         )
 
         # --- Transition to WAITING_CLOSE ---
@@ -252,6 +264,41 @@ class StrategyWrapper:
         pnl = close_info.get("pnl", 0.0)
         logger.info("POSITION_CLOSED: reason=%s pnl=%.2f", reason, pnl)
         self._state = StrategyState.IDLE
+
+    def on_order_update(self, update: Dict[str, Any]) -> None:
+        """
+        Callback from execution engine on each order status update.
+
+        Handles the case where an ENTRY order is abandoned before filling
+        (timeout/expire/reject). C++ only manages the exit lifecycle once a
+        position exists, so a never-filled entry would otherwise leave the brain
+        stuck in WAITING_CLOSE forever. Here we reset to IDLE so entry detection
+        resumes.
+        """
+        status = update.get("status", "")
+        reduce_only = update.get("reduce_only", False)
+        filled_qty = float(update.get("filled_quantity", 0.0))
+        reason = update.get("reason", "")
+
+        # Only a non-reduce-only (entry) order that terminal'd WITHOUT filling
+        # matters here. FILLED is the normal open; a partial fill leaves a live
+        # position (handled by sync_close_from_state); a cancel that is followed
+        # by a reprice/market keeps the entry alive — ignore those.
+        if reduce_only or self._state != StrategyState.WAITING_CLOSE:
+            return
+        if status not in ("CANCELED", "EXPIRED", "REJECTED"):
+            return
+        if filled_qty > 0.0:
+            return
+        if reason in ("timeout_reprice", "timeout_market"):
+            return  # another order follows; entry still pending
+
+        logger.info(
+            "ENTRY abandoned (status=%s reason=%s); re-arming entries",
+            status, reason,
+        )
+        self._state = StrategyState.IDLE
+        self._saw_position = False
 
     def reset(self) -> None:
         """Reset state and clear indicator history (e.g., for backtest restart)."""
@@ -351,6 +398,15 @@ class StrategyWrapper:
             "atr_period": cfg["trigger"]["params"].get("atr_period", 20),
         }
 
+        # Execution spec (entry/exit order handling) — optional; defaults to the
+        # aggressive market defaults when absent.
+        entry_execution = DEFAULT_ENTRY_EXECUTION
+        exit_execution = DEFAULT_EXIT_EXECUTION
+        if exec_cfg.get("entry"):
+            entry_execution = ExecutionSpec.from_dict(exec_cfg["entry"])
+        if exec_cfg.get("exit"):
+            exit_execution = ExecutionSpec.from_dict(exec_cfg["exit"])
+
         return cls(
             trigger=trigger,
             feature=feature,
@@ -362,4 +418,6 @@ class StrategyWrapper:
             indicator_params=indicator_params,
             signal_threshold=model_cfg.get("threshold", 0.0),
             symbol=exec_cfg.get("symbol", "BTCUSDT"),
+            entry_execution=entry_execution,
+            exit_execution=exit_execution,
         )

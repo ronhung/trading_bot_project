@@ -46,6 +46,10 @@ class BinanceZmqExecutionGateway(LiveExecutionGateway):
                 "indicator": order.trailing_exit_indicator.value,
                 "period": order.trailing_exit_period,
             },
+            execution={
+                "entry": order.entry_execution.to_dict(),
+                "exit": order.exit_execution.to_dict(),
+            },
         )
         print(
             f"  [Gateway] Sent {order.action.value} "

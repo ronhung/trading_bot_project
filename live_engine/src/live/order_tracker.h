@@ -22,6 +22,9 @@ struct TrackedOrder {
     int reprice_attempts = 0;
     std::chrono::steady_clock::time_point created_at;
     bool reported_terminal = false;  // dedupe publishes across threads
+
+    // Execution spec (how to place + handle unfilled) — copied from the order.
+    ExecutionSpec execution;
 };
 
 class OrderTracker {
@@ -39,8 +42,10 @@ public:
                          const std::string& status,        // NEW, PARTIALLY_FILLED, FILLED, CANCELED...
                          double filled_qty);
 
-    // Returns orders that have been in NEW or PARTIALLY_FILLED state for > timeout_ms.
-    std::vector<TrackedOrder> get_timed_out_orders(int timeout_ms);
+    // Returns orders that have been in NEW/PARTIALLY_FILLED for longer than
+    // their own timeout_ms (orders with timeout_ms == 0 are never returned —
+    // e.g. MARKET orders that fill immediately).
+    std::vector<TrackedOrder> get_timed_out_orders();
 
     // Mark an order as cancelled after the watchdog's cancel succeeded.
     // Marks terminal only (does NOT publish) — the caller publishes the single

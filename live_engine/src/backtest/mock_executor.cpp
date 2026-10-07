@@ -14,6 +14,10 @@ void MockExecutor::set_market(const KLineData& bar) {
     current_bar_ = bar;
 }
 
+void MockExecutor::set_exit_execution(const ExecutionSpec& exit_exec) {
+    exit_execution_ = exit_exec;
+}
+
 bool MockExecutor::get_current_position(const std::string& symbol, double& out_position) {
     (void)symbol;
     if (!risk_) {
@@ -49,13 +53,25 @@ void MockExecutor::record_trade(const std::string& symbol, const std::string& si
     trades_.push_back(rec);
 }
 
-bool MockExecutor::send_order(const std::string& symbol,
-                              const std::string& side,
-                              double quantity,
-                              double price,
-                              bool reduce_only) {
+bool MockExecutor::send_order(const OrderRequest& req) {
+    const std::string& symbol = req.symbol;
+    const std::string& side = req.side;
+    const double quantity = req.quantity;
+    const double price = req.price;
+    const bool reduce_only = req.reduce_only;
+
     if (!risk_ || quantity <= 0.0 || price <= 0.0) {
         return false;
+    }
+
+    // Backtest fill model: MARKET / IOC fill immediately at price ± slippage.
+    // LIMIT / LIMIT_MAKER also fill immediately for now (Phase D — no resting-
+    // limit simulation yet); log so the mismatch is visible rather than silent.
+    const std::string& ot = req.execution.order_type;
+    if (ot != "MARKET" && ot != "IOC") {
+        std::cout << "⚠️ [MockExecutor] " << ot
+                  << " order modeled as immediate fill (resting-limit simulation not implemented)."
+                  << std::endl;
     }
 
     double fill_price = apply_slippage(side, price);
@@ -165,7 +181,14 @@ bool MockExecutor::check_and_execute_stop(const std::string& symbol) {
             double pos = risk_->get_current_position();
             std::string close_side = (pos > 0.0) ? "SELL" : "BUY";
             std::cout << "🛑 [MockExecutor] " << reason << " hit @ " << exit_price << std::endl;
-            send_order(symbol, close_side, std::abs(pos), exit_price, true);
+            OrderRequest close_req;
+            close_req.symbol = symbol;
+            close_req.side = close_side;
+            close_req.quantity = std::abs(pos);
+            close_req.price = exit_price;
+            close_req.reduce_only = true;
+            close_req.execution = exit_execution_;
+            send_order(close_req);
             fired = true;
         }
     }

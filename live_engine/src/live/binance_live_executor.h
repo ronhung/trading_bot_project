@@ -19,11 +19,7 @@ public:
     ~BinanceLiveExecutor() override;
 
     // IOrderExecutor overrides
-    bool send_order(const std::string& symbol,
-                    const std::string& side,
-                    double quantity,
-                    double price,
-                    bool reduce_only = false) override;
+    bool send_order(const OrderRequest& req) override;
 
     void set_order_status_callback(std::function<void(const OrderStatusUpdate&)>) override;
     bool has_open_order() const override;
@@ -34,6 +30,9 @@ public:
     // Arm the client-side trailing exit for a just-opened position.
     // Same TrailingStop class as the backtest MockExecutor.
     void arm_trailing_exit(const std::string& indicator, int period) override;
+
+    // Store the EXIT execution spec (used when check_trailing_exit places the close).
+    void set_exit_execution(const ExecutionSpec& exit_exec) override;
 
     // Per-bar trailing-exit check. Called from the main loop on each closed
     // kline; fires a reduce-only close when the trailing stop is hit.
@@ -81,13 +80,9 @@ private:
     // Get current market price via REST ticker
     double get_market_price(const std::string& symbol);
 
-    // Internal: place a LIMIT order (used by send_order and reprice)
-    bool place_order_internal(const std::string& symbol,
-                              const std::string& side,
-                              double quantity,
-                              double price,
-                              bool reduce_only,
-                              int reprice_attempts);
+    // Internal: place an order (used by send_order and reprice) according to
+    // req.execution (order_type / time_in_force).
+    bool place_order_internal(const OrderRequest& req, int reprice_attempts);
 
     // Reprice a timed-out order at current market
     void reprice_order(const TrackedOrder& ord);
@@ -122,7 +117,5 @@ private:
     TrailingStop trailing_stop_;
     bool trailing_fired_ = false;   // close already submitted; wait for position to clear
     std::mutex trailing_mtx_;       // guards trailing_stop_ across rx-thread vs main-loop
-
-    static constexpr std::chrono::minutes kOrderTimeout{3};
-    static constexpr int kMaxRepriceAttempts = 2;
+    ExecutionSpec exit_execution_;  // how the trailing-stop / hard-stop close is placed
 };

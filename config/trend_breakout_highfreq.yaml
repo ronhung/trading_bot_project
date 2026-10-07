@@ -50,3 +50,20 @@ model:
   type: "xgboost_classifier"   # P(win) filter
   target: "r_multiple"
   output_prefix: "trend_breakout_highfreq"
+
+# Execution: how orders are placed + how unfilled orders are handled.
+# Breakout entries are momentum — take liquidity (market). Stops are market with
+# a short timeout → market fallback.
+execution:
+  entry:
+    order_type: market
+    time_in_force: gtc
+    timeout_ms: 0
+    unfilled_policy: cancel
+    max_reprice_attempts: 2
+  exit:
+    order_type: market
+    time_in_force: gtc
+    timeout_ms: 3000
+    unfilled_policy: market
+    max_reprice_attempts: 2

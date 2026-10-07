@@ -64,7 +64,7 @@ void OrderTracker::on_order_update(const std::string& client_order_id,
     }
 }
 
-std::vector<TrackedOrder> OrderTracker::get_timed_out_orders(int timeout_ms) {
+std::vector<TrackedOrder> OrderTracker::get_timed_out_orders() {
     std::vector<TrackedOrder> result;
     auto now = std::chrono::steady_clock::now();
 
@@ -73,9 +73,11 @@ std::vector<TrackedOrder> OrderTracker::get_timed_out_orders(int timeout_ms) {
         if ((ord.status == TrackedOrderStatus::NEW ||
              ord.status == TrackedOrderStatus::PARTIALLY_FILLED) &&
             !ord.reported_terminal) {
+            // Per-order timeout: only chase orders that requested a timeout.
+            if (ord.execution.timeout_ms <= 0) continue;
             auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - ord.created_at).count();
-            if (age >= timeout_ms) {
+            if (age >= ord.execution.timeout_ms) {
                 result.push_back(ord);
             }
         }
@@ -130,8 +132,9 @@ void OrderTracker::fire_update(const TrackedOrder& order) {
     u.client_order_id = order.client_order_id;
     u.symbol = order.symbol;
     u.side = order.side;
-    u.order_type = "LIMIT";
+    u.order_type = order.execution.order_type;
     u.quantity = order.quantity;
+    u.filled_quantity = order.filled_quantity;
     u.price = order.price;
     u.reduce_only = order.reduce_only;
 

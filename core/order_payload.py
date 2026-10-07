@@ -14,6 +14,12 @@ from enum import Enum
 from typing import Optional
 import time
 
+from core.execution_spec import (
+    ExecutionSpec,
+    DEFAULT_ENTRY_EXECUTION,
+    DEFAULT_EXIT_EXECUTION,
+)
+
 
 class Action(str, Enum):
     """Order action: BUY (open long) or SELL (open short)."""
@@ -63,6 +69,8 @@ class OrderPayload:
     trailing_exit_period: int
     take_profit: Optional[float] = None
     signal_timestamp: float = field(default_factory=time.time)
+    entry_execution: ExecutionSpec = field(default_factory=lambda: DEFAULT_ENTRY_EXECUTION)
+    exit_execution: ExecutionSpec = field(default_factory=lambda: DEFAULT_EXIT_EXECUTION)
 
     def to_dict(self) -> dict:
         """Serialize to dict for ZMQ JSON transmission."""
@@ -75,6 +83,10 @@ class OrderPayload:
             "trailing_exit": {
                 "indicator": self.trailing_exit_indicator.value,
                 "period": self.trailing_exit_period,
+            },
+            "execution": {
+                "entry": self.entry_execution.to_dict(),
+                "exit": self.exit_execution.to_dict(),
             },
             "timestamp": self.signal_timestamp,
         }

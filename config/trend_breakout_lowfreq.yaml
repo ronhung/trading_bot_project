@@ -48,3 +48,20 @@ labeler:
     trail_period: 3600
 
 # model: intentionally omitted — ML doesn't add value at low frequency.
+
+# Execution: how orders are placed + how unfilled orders are handled.
+# Breakout entries are momentum — take liquidity (market). Stops are market with
+# a short timeout → market fallback.
+execution:
+  entry:
+    order_type: market
+    time_in_force: gtc
+    timeout_ms: 0
+    unfilled_policy: cancel
+    max_reprice_attempts: 2
+  exit:
+    order_type: market
+    time_in_force: gtc
+    timeout_ms: 3000
+    unfilled_policy: market
+    max_reprice_attempts: 2

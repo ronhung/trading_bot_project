@@ -70,36 +70,49 @@ void BinanceLiveExecutor::publish_status(const OrderStatusUpdate& u) {
 // ---------------------------------------------------------------------------
 // Core order placement (used by send_order and reprice)
 // ---------------------------------------------------------------------------
-bool BinanceLiveExecutor::place_order_internal(const std::string& symbol,
-                                                const std::string& side,
-                                                double quantity,
-                                                double price,
-                                                bool reduce_only,
-                                                int reprice_attempts) {
+bool BinanceLiveExecutor::place_order_internal(const OrderRequest& req, int reprice_attempts) {
     auto now = std::chrono::system_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
     std::string cid = next_client_order_id();
 
     // Round to Binance tick/step sizes (BTCUSDT: price=0.01, qty=0.001)
-    double rounded_price = std::round(price * 100.0) / 100.0;
-    double rounded_qty   = std::floor(quantity * 1000.0) / 1000.0;
+    double rounded_price = std::round(req.price * 100.0) / 100.0;
+    double rounded_qty   = std::floor(req.quantity * 1000.0) / 1000.0;
     if (rounded_qty <= 0.0) {
         std::cerr << "⚠️ [BinanceLiveExecutor] Rounded quantity is zero; rejecting order." << std::endl;
         return false;
     }
 
+    // Map the execution spec to Binance type + timeInForce.
+    std::string type;
+    std::string tif;
+    const std::string& ot = req.execution.order_type;
+    if (ot == "MARKET") {
+        type = "MARKET";
+    } else if (ot == "LIMIT_MAKER") {
+        type = "LIMIT";
+        tif = "GTX";                       // post-only
+    } else {
+        type = "LIMIT";
+        tif = req.execution.time_in_force;
+    }
+
     std::stringstream query_ss;
-    query_ss << "symbol=" << symbol
-             << "&side=" << side
-             << "&type=LIMIT"
-             << "&timeInForce=GTC"
-             << "&quantity=" << rounded_qty
-             << "&price=" << rounded_price
-             << "&newClientOrderId=" << cid
+    query_ss << "symbol=" << req.symbol
+             << "&side=" << req.side
+             << "&type=" << type;
+    if (!tif.empty()) {
+        query_ss << "&timeInForce=" << tif;
+    }
+    query_ss << "&quantity=" << rounded_qty;
+    if (type != "MARKET") {
+        query_ss << "&price=" << rounded_price;  // MARKET ignores price
+    }
+    query_ss << "&newClientOrderId=" << cid
              << "&timestamp=" << ms;
 
-    if (reduce_only) {
+    if (req.reduce_only) {
         query_ss << "&reduceOnly=true";
     }
     std::string query_string = query_ss.str();
@@ -113,10 +126,11 @@ bool BinanceLiveExecutor::place_order_internal(const std::string& symbol,
     httplib::Client cli("https://testnet.binancefuture.com");
     cli.set_connection_timeout(5);
 
-    std::cout << "\n🔫 [BinanceLiveExecutor] Sending " << side << " " << symbol
+    std::cout << "\n🔫 [BinanceLiveExecutor] Sending " << req.side << " " << req.symbol
               << " @ " << rounded_price << " (qty: " << rounded_qty
+              << ", type: " << type << (tif.empty() ? "" : "/" + tif)
               << ", cid: " << cid
-              << (reduce_only ? ", reduceOnly" : "")
+              << (req.reduce_only ? ", reduceOnly" : "")
               << (reprice_attempts > 0 ? ", reprice#" + std::to_string(reprice_attempts) : "")
               << ")" << std::endl;
 
@@ -132,14 +146,15 @@ bool BinanceLiveExecutor::place_order_internal(const std::string& symbol,
             TrackedOrder tracked;
             tracked.order_id = order_id;
             tracked.client_order_id = cid;
-            tracked.symbol = symbol;
-            tracked.side = side;
+            tracked.symbol = req.symbol;
+            tracked.side = req.side;
             tracked.quantity = rounded_qty;
             tracked.filled_quantity = executed_qty;
             tracked.price = rounded_price;
-            tracked.reduce_only = reduce_only;
+            tracked.reduce_only = req.reduce_only;
             tracked.reprice_attempts = reprice_attempts;
             tracked.created_at = std::chrono::steady_clock::now();
+            tracked.execution = req.execution;
             if (status == "NEW") tracked.status = TrackedOrderStatus::NEW;
             else if (status == "PARTIALLY_FILLED") tracked.status = TrackedOrderStatus::PARTIALLY_FILLED;
             else if (status == "FILLED") tracked.status = TrackedOrderStatus::FILLED;
@@ -178,12 +193,8 @@ bool BinanceLiveExecutor::place_order_internal(const std::string& symbol,
     return false;
 }
 
-bool BinanceLiveExecutor::send_order(const std::string& symbol,
-                                     const std::string& side,
-                                     double quantity,
-                                     double price,
-                                     bool reduce_only) {
-    return place_order_internal(symbol, side, quantity, price, reduce_only, 0);
+bool BinanceLiveExecutor::send_order(const OrderRequest& req) {
+    return place_order_internal(req, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +202,11 @@ bool BinanceLiveExecutor::send_order(const std::string& symbol,
 // ---------------------------------------------------------------------------
 void BinanceLiveExecutor::set_risk_manager(RiskManager* risk) {
     risk_ = risk;
+}
+
+void BinanceLiveExecutor::set_exit_execution(const ExecutionSpec& exit_exec) {
+    std::lock_guard<std::mutex> lk(trailing_mtx_);
+    exit_execution_ = exit_exec;
 }
 
 void BinanceLiveExecutor::arm_now_locked() {
@@ -220,9 +236,11 @@ void BinanceLiveExecutor::check_trailing_exit(const KLineData& bar) {
     bool fire = false;
     double exit_price = 0.0;
     std::string close_side;
+    ExecutionSpec exit_spec;
 
     {
         std::lock_guard<std::mutex> lk(trailing_mtx_);
+        exit_spec = exit_execution_;
 
         if (pos == 0.0) {
             // Position cleared (exchange ACCOUNT_UPDATE) — disarm.
@@ -249,7 +267,14 @@ void BinanceLiveExecutor::check_trailing_exit(const KLineData& bar) {
     if (fire) {
         std::cout << "🛑 [BinanceLiveExecutor] " << "trailing_stop"
                   << " hit @ " << exit_price << std::endl;
-        send_order(bar.symbol, close_side, std::abs(pos), exit_price, true);
+        OrderRequest close_req;
+        close_req.symbol = bar.symbol;
+        close_req.side = close_side;
+        close_req.quantity = std::abs(pos);
+        close_req.price = exit_price;
+        close_req.reduce_only = true;
+        close_req.execution = exit_spec;
+        send_order(close_req);
     }
 }
 
@@ -386,8 +411,14 @@ void BinanceLiveExecutor::reprice_order(const TrackedOrder& ord) {
               << " | remaining=" << remaining << " | attempt=" << (ord.reprice_attempts + 1)
               << std::endl;
 
-    place_order_internal(ord.symbol, ord.side, remaining, new_price,
-                         ord.reduce_only, ord.reprice_attempts + 1);
+    OrderRequest req;
+    req.symbol = ord.symbol;
+    req.side = ord.side;
+    req.quantity = remaining;
+    req.price = new_price;
+    req.reduce_only = ord.reduce_only;
+    req.execution = ord.execution;  // same order_type / timeout / policy; chase again
+    place_order_internal(req, ord.reprice_attempts + 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -397,8 +428,7 @@ void BinanceLiveExecutor::start_order_monitor() {
     if (monitor_running_.load()) return;
     monitor_running_ = true;
     monitor_thread_ = std::thread(&BinanceLiveExecutor::monitor_loop, this);
-    std::cout << "⏱️ [OrderMonitor] Started (timeout=" << kOrderTimeout.count() << "min, max reprice="
-              << kMaxRepriceAttempts << ")" << std::endl;
+    std::cout << "⏱️ [OrderMonitor] Started (per-order timeout + unfilled policy)" << std::endl;
 }
 
 void BinanceLiveExecutor::stop_order_monitor() {
@@ -424,10 +454,8 @@ void BinanceLiveExecutor::monitor_loop() {
         // Prune old terminal orders
         order_tracker_.prune(600000);  // 10 min
 
-        // Check for timed-out orders
-        int timeout_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            kOrderTimeout).count());
-        auto timed_out = order_tracker_.get_timed_out_orders(timeout_ms);
+        // Check for timed-out orders (per-order timeout from the execution spec)
+        auto timed_out = order_tracker_.get_timed_out_orders();
 
         for (auto& ord : timed_out) {
             // ── Guard #1: verify the order still exists on the exchange ──
@@ -455,84 +483,86 @@ void BinanceLiveExecutor::monitor_loop() {
                 continue;  // ← skip cancel entirely
             }
 
-            // ── Guard #2: proceed with cancel ──
-            if (ord.reprice_attempts >= kMaxRepriceAttempts) {
-                // Exhausted: cancel and report
-                std::cout << "⏰ [OrderMonitor] " << ord.client_order_id
-                          << " timed out with " << ord.reprice_attempts
-                          << " reprice attempts — canceling (exhausted)." << std::endl;
+            // ── Guard #2: decide the timeout action from this order's policy ──
+            const std::string& policy = ord.execution.unfilled_policy;
+            bool exhausted = false;
+            std::string action;  // "cancel" | "reprice" | "market"
+            if (policy == "MARKET") {
+                action = "market";
+            } else if (policy == "REPRICE") {
+                exhausted = (ord.reprice_attempts >= ord.execution.max_reprice_attempts);
+                action = exhausted ? "cancel" : "reprice";
+            } else {  // CANCEL
+                action = "cancel";
+            }
 
-                bool was_canceled = cancel_order(ord.symbol, ord.client_order_id);
+            std::cout << "⏰ [OrderMonitor] " << ord.client_order_id
+                      << " timed out (policy=" << policy
+                      << ", reprice#" << ord.reprice_attempts << ") -> " << action
+                      << std::endl;
 
-                if (was_canceled) {
-                    order_tracker_.mark_cancel_requested(ord.client_order_id);
+            bool was_canceled = cancel_order(ord.symbol, ord.client_order_id);
 
-                    OrderStatusUpdate u;
-                    u.client_order_id = ord.client_order_id;
-                    u.symbol = ord.symbol;
-                    u.side = ord.side;
-                    u.order_type = "LIMIT";
-                    u.quantity = ord.quantity;
-                    u.price = ord.price;
-                    u.status = "CANCELED";
-                    u.reduce_only = ord.reduce_only;
-                    u.reason = "timeout_exhausted";
-                    publish_status(u);
-                } else {
-                    // Cancel was rejected — even though we just queried and it
-                    // was open, a fill may have raced in.  Sync from the
-                    // exchange one more time so the tracker won't retry.
-                    std::cout << "⚠️ [OrderMonitor] Cancel rejected for "
-                              << ord.client_order_id
-                              << " — syncing from exchange." << std::endl;
+            if (!was_canceled) {
+                // Cancel was rejected — even though we just queried and it was
+                // open, a fill may have raced in. Sync from the exchange so the
+                // tracker won't retry, and do NOT follow up (would double-fill).
+                std::cout << "⚠️ [OrderMonitor] Cancel rejected for "
+                          << ord.client_order_id
+                          << " — syncing from exchange; will not follow up."
+                          << std::endl;
 
-                    std::string post_status;
-                    if (query_order_status(ord.symbol, ord.client_order_id,
-                                           post_status)) {
-                        order_tracker_.on_order_update(ord.client_order_id,
-                                                       post_status, 0.0);
-                    }
+                std::string post_status;
+                if (query_order_status(ord.symbol, ord.client_order_id,
+                                       post_status)) {
+                    order_tracker_.on_order_update(ord.client_order_id,
+                                                   post_status, 0.0);
                 }
+                continue;
+            }
 
+            order_tracker_.mark_cancel_requested(ord.client_order_id);
+
+            // Publish the CANCELED update. The reason tells Python whether the
+            // entry is still pending (another order follows) or abandoned.
+            OrderStatusUpdate cu;
+            cu.client_order_id = ord.client_order_id;
+            cu.symbol = ord.symbol;
+            cu.side = ord.side;
+            cu.order_type = ord.execution.order_type;
+            cu.quantity = ord.quantity;
+            cu.filled_quantity = ord.filled_quantity;
+            cu.price = ord.price;
+            cu.status = "CANCELED";
+            cu.reduce_only = ord.reduce_only;
+            if (action == "reprice") {
+                cu.reason = "timeout_reprice";
+            } else if (action == "market") {
+                cu.reason = "timeout_market";
             } else {
-                // Cancel and reprice
-                std::cout << "⏰ [OrderMonitor] " << ord.client_order_id
-                          << " timed out (" << ord.reprice_attempts
-                          << " prev reprice(s)) — cancel + reprice." << std::endl;
+                cu.reason = "timeout_abandoned";
+            }
+            publish_status(cu);
 
-                bool was_canceled = cancel_order(ord.symbol, ord.client_order_id);
-
-                if (was_canceled) {
-                    // Cancel succeeded — mark terminal, publish, reprice
-                    order_tracker_.mark_cancel_requested(ord.client_order_id);
-
-                    OrderStatusUpdate cu;
-                    cu.client_order_id = ord.client_order_id;
-                    cu.symbol = ord.symbol;
-                    cu.side = ord.side;
-                    cu.order_type = "LIMIT";
-                    cu.quantity = ord.quantity;
-                    cu.price = ord.price;
-                    cu.status = "CANCELED";
-                    cu.reduce_only = ord.reduce_only;
-                    cu.reason = "timeout";
-                    publish_status(cu);
-
-                    reprice_order(ord);
-                } else {
-                    // Cancel was rejected — sync from exchange to prevent
-                    // infinite retry.  Do NOT reprice (would double-fill).
-                    std::cout << "⚠️ [OrderMonitor] Cancel rejected for "
-                              << ord.client_order_id
-                              << " — syncing from exchange; will not reprice."
-                              << std::endl;
-
-                    std::string post_status;
-                    if (query_order_status(ord.symbol, ord.client_order_id,
-                                           post_status)) {
-                        order_tracker_.on_order_update(ord.client_order_id,
-                                                       post_status, 0.0);
-                    }
+            // Follow-up: chase (reprice) or hard-eat at market.
+            if (action == "reprice") {
+                reprice_order(ord);
+            } else if (action == "market") {
+                double remaining = ord.quantity - ord.filled_quantity;
+                if (remaining > 0.0) {
+                    std::cout << "🍽️ [OrderMonitor] Hard-eating remaining "
+                              << remaining << " at market." << std::endl;
+                    OrderRequest mkt;
+                    mkt.symbol = ord.symbol;
+                    mkt.side = ord.side;
+                    mkt.quantity = remaining;
+                    mkt.price = ord.price;
+                    mkt.reduce_only = ord.reduce_only;
+                    mkt.execution = ord.execution;
+                    mkt.execution.order_type = "MARKET";
+                    mkt.execution.timeout_ms = 0;
+                    mkt.execution.unfilled_policy = "CANCEL";
+                    send_order(mkt);
                 }
             }
         }

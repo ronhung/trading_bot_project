@@ -6,6 +6,19 @@
 
 using json = nlohmann::json;
 
+// Parse a Python ExecutionSpec dict into the C++ struct. Defaults mirror
+// Python's ExecutionSpec (aggressive market entry).
+static ExecutionSpec parse_execution(const json& j) {
+    ExecutionSpec spec;
+    if (!j.is_object()) return spec;
+    spec.order_type = j.value("order_type", "MARKET");
+    spec.time_in_force = j.value("time_in_force", "GTC");
+    spec.timeout_ms = j.value("timeout_ms", 0);
+    spec.unfilled_policy = j.value("unfilled_policy", "CANCEL");
+    spec.max_reprice_attempts = j.value("max_reprice_attempts", 2);
+    return spec;
+}
+
 IpcServer::IpcServer(int pub_port, int pull_port,
                      IOrderExecutor* executor, RiskManager* risk_manager,
                      bool sync_mode)
@@ -99,6 +112,7 @@ void IpcServer::queue_order_update(const OrderStatusUpdate& u) {
     j["price"] = u.price;
     j["status"] = u.status;
     j["reduce_only"] = u.reduce_only;
+    j["filled_quantity"] = u.filled_quantity;
     j["reason"] = u.reason;
     order_update_queue_.push(j.dump());
 }
@@ -185,10 +199,24 @@ void IpcServer::handle_message(const std::string& msg_str) {
         trailing_period = j["trailing_exit"].value("period", 0);
     }
 
+    // Execution spec for this order (entry) + the exit close that will follow.
+    ExecutionSpec entry_exec;
+    ExecutionSpec exit_exec;
+    if (j.contains("execution") && j["execution"].is_object()) {
+        if (j["execution"].contains("entry")) {
+            entry_exec = parse_execution(j["execution"]["entry"]);
+        }
+        if (j["execution"].contains("exit")) {
+            exit_exec = parse_execution(j["execution"]["exit"]);
+        }
+    }
+
     std::cout << "\n⚡ [C++ Received command] action: " << action
               << " | symbol: " << symbol
               << " | trigger price: " << price
-              << " | stop price: " << stop_price << std::endl;
+              << " | stop price: " << stop_price
+              << " | exec=" << entry_exec.order_type << "/" << entry_exec.unfilled_policy
+              << std::endl;
 
     if (!executor_ || !risk_manager_) {
         return;
@@ -214,9 +242,19 @@ void IpcServer::handle_message(const std::string& msg_str) {
             std::cout << "🚫 [IPC] Insufficient balance or invalid stop, cancel open position." << std::endl;
             return;
         }
-        bool ok = executor_->send_order(symbol, action, safe_quantity, price, false);
+
+        OrderRequest req;
+        req.symbol = symbol;
+        req.side = action;
+        req.quantity = safe_quantity;
+        req.price = price;
+        req.reduce_only = false;
+        req.execution = entry_exec;
+
+        bool ok = executor_->send_order(req);
         if (ok) {
             risk_manager_->set_stop_price(stop_price);
+            executor_->set_exit_execution(exit_exec);
             executor_->arm_trailing_exit(trailing_indicator, trailing_period);
         } else {
             std::cout << "❌ [IPC] Order rejected by executor (not tracked)." << std::endl;
@@ -255,7 +293,18 @@ void IpcServer::handle_message(const std::string& msg_str) {
         double close_quantity = std::abs(verified_pos);
         std::cout << "🛡️ [Close " << (action == "CLOSE_LONG" ? "Long" : "Short")
                   << "] qty=" << close_quantity << " | " << close_side << " + reduceOnly" << std::endl;
-        bool ok = executor_->send_order(symbol, close_side, close_quantity, price, true);
+
+        OrderRequest req;
+        req.symbol = symbol;
+        req.side = close_side;
+        req.quantity = close_quantity;
+        req.price = price;
+        req.reduce_only = true;
+        // Manual closes are aggressive: no execution travels with this legacy
+        // path, so default to MARKET reduce-only.
+        req.execution.order_type = "MARKET";
+
+        bool ok = executor_->send_order(req);
         if (ok) {
             risk_manager_->clear_stop();
         }

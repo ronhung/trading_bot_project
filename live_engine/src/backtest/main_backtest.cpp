@@ -48,6 +48,8 @@ int main(int argc, char** argv) {
         double initial_balance = 100000.0;
         double risk_pct = 0.02;
         double max_leverage = 20.0;
+        double fee_rate = 0.0005;      // 0.05% per side (taker)
+        double slippage_bps = 1.0;     // 1 bps = 0.01% per side
 
         if (argc >= 2) csv_path = argv[1];
         if (argc >= 3) trades_out = argv[2];
@@ -72,6 +74,12 @@ int main(int argc, char** argv) {
                 if (bt.contains("max_leverage")) {
                     max_leverage = bt["max_leverage"].get<double>();
                 }
+                if (bt.contains("fee_rate")) {
+                    fee_rate = bt["fee_rate"].get<double>();
+                }
+                if (bt.contains("slippage_bps")) {
+                    slippage_bps = bt["slippage_bps"].get<double>();
+                }
             }
         } else {
             std::cout << "⚠️ Config not found at " << config_path << " (using defaults)" << std::endl;
@@ -81,7 +89,7 @@ int main(int argc, char** argv) {
         risk_manager.update_balance(initial_balance);
         risk_manager.update_position(0.0);
 
-        MockExecutor mock(&risk_manager, 0.0005 /* 0.05% */, 1.0 /* 1 bps */);
+        MockExecutor mock(&risk_manager, fee_rate, slippage_bps);
         IpcServer ipc(pub_port, pull_port, &mock, &risk_manager, true /* sync */);
 
         std::cout << "👑 Backtest engine starting..." << std::endl;
