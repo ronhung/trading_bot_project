@@ -114,17 +114,29 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
         window_size = self._warmup_period + 1
         fetch_limit = window_size + 5
 
+        # Binance futures /fapi/v1/klines caps `limit` at 1500 per request, so
+        # page backwards with `endTime` until we have enough bars.
         url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {
-            "symbol": self.symbol,
-            "interval": "1m",
-            "limit": fetch_limit,
-        }
+        batch = 1500
 
+        raw_klines = []
+        end_time = None
         try:
-            resp = requests.get(url, params=params, timeout=10)
-            resp.raise_for_status()
-            raw_klines = resp.json()
+            while len(raw_klines) < fetch_limit:
+                params = {
+                    "symbol": self.symbol,
+                    "interval": "1m",
+                    "limit": batch,
+                }
+                if end_time is not None:
+                    params["endTime"] = end_time
+                resp = requests.get(url, params=params, timeout=10)
+                resp.raise_for_status()
+                page = resp.json()
+                if not page:
+                    break
+                raw_klines = page + raw_klines          # prepend older bars
+                end_time = int(page[0][0]) - 1          # next page ends before the oldest
         except Exception as e:
             print(f"  [Warmup] REST fetch failed: {e}")
             print("    Starting cold — waiting for real-time bars...")
@@ -134,7 +146,7 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
             print("  [Warmup] REST returned empty klines array")
             return []
 
-        # Drop the still-forming (in-progress) candle
+        # Drop the still-forming (in-progress) candle (the most recent bar)
         closed = raw_klines[:-1] if len(raw_klines) > 1 else raw_klines
         bars = []
         for k in closed:
