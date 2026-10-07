@@ -59,6 +59,12 @@ class LiveTurtleBot:
         classifier: bool = False,
     ):
         self.symbol = symbol
+        self.warmup = warmup
+
+        # Effective trend period (only for trend_breakout) + full warmup window,
+        # so the incremental indicators start fully warm on live.
+        _trend_period = (trend_period or period * 4) if trigger_type == "trend_breakout" else 0
+        _warmup_period = max(period, trail_period, _trend_period)
 
         # -- Data feeder --
         self.feeder = BinanceZmqDataFeeder(
@@ -66,6 +72,7 @@ class LiveTurtleBot:
             entry_period=period,
             atr_period=period,
             warmup=warmup,
+            warmup_period=_warmup_period,
         )
 
         # -- Execution gateway (shares ZMQ client with feeder) --
@@ -73,8 +80,7 @@ class LiveTurtleBot:
 
         # -- Strategy components (DI — swap objects to change strategy) --
         if trigger_type == "trend_breakout":
-            tp = trend_period or period * 4
-            trigger = TrendFilteredBreakoutTrigger(entry_period=period, trend_period=tp)
+            trigger = TrendFilteredBreakoutTrigger(entry_period=period, trend_period=_trend_period)
         else:
             trigger = AdamBreakoutTrigger(period=period)
 
@@ -93,7 +99,7 @@ class LiveTurtleBot:
             "atr_period": period,
         }
         if trigger_type == "trend_breakout":
-            indicator_params["ma_period"] = trend_period or period * 4
+            indicator_params["ma_period"] = _trend_period
 
         # -- ML model (optional) --
         model = None
@@ -122,9 +128,10 @@ class LiveTurtleBot:
             indicator_params=indicator_params,
             signal_threshold=signal_threshold,
             symbol=symbol,
-            # Backtest (--no-warmup) has synchronous fills and no POSITION_CLOSED
-            # message, so detect the close from the synced current_position.
-            sync_close_from_state=not warmup,
+            # Detect the close from the synced current_position (both backtest
+            # and live). StrategyWrapper._saw_position makes this safe for live's
+            # async fills: it only re-arms after a real open->closed transition.
+            sync_close_from_state=True,
         )
 
         # Wire position_closed callback
@@ -135,6 +142,10 @@ class LiveTurtleBot:
     def start(self) -> None:
         """Connect and begin the event loop."""
         self.feeder.connect()
+        if self.warmup:
+            bars = self.feeder.warmup()
+            if bars:
+                self.strategy.warmup(bars)
         self.feeder.start(self._on_bar)
 
     def _on_bar(self, bar_data: dict, portfolio_state: dict) -> None:

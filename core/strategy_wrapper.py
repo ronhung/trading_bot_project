@@ -259,6 +259,20 @@ class StrategyWrapper:
         self._saw_position = False
         self._incremental = IncrementalIndicators(**self._indicator_params)
 
+    def warmup(self, bars: List[Dict[str, Any]]) -> None:
+        """Feed historical bars into the incremental indicators (live cold-start).
+
+        No entry detection is performed — this only warms the rolling lookback
+        so the first live signal fires immediately instead of waiting for the
+        full indicator window.
+        """
+        for bar in bars:
+            self._incremental.update(bar)
+
+    def warmup_bars_needed(self) -> int:
+        """Number of historical bars required to fully warm the indicators."""
+        return max(self._indicator_params.values()) if self._indicator_params else 0
+
     @classmethod
     def from_yaml(cls, config_path: str) -> "StrategyWrapper":
         """

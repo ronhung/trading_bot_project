@@ -39,6 +39,7 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
         entry_period: int = 20,
         atr_period: int = 20,
         warmup: bool = True,
+        warmup_period: int | None = None,
         host: str = "localhost",
         sub_port: int = 5555,
         push_port: int = 5556,
@@ -49,6 +50,9 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
             entry_period: Donchian lookback (bars) — determines buffer size.
             atr_period: ATR smoothing period.
             warmup: If True, REST fetch historical bars to pre-fill buffer.
+            warmup_period: Bars to fetch for warmup (defaults to the max of
+                entry/atr). Pass the strategy's full max lookback so the
+                incremental indicators are fully warm.
             host: ZMQ host.
             sub_port: ZMQ SUB port (market data from C++).
             push_port: ZMQ PUSH port (signals to C++).
@@ -57,9 +61,10 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
         self._entry_period = entry_period
         self._atr_period = atr_period
         self._do_warmup = warmup
+        self._warmup_period = warmup_period or max(entry_period, atr_period)
 
         # Buffer for strategy computation
-        self._max_len = max(entry_period, atr_period) + 1
+        self._max_len = self._warmup_period + 1
         self.kline_buffer: deque = deque(maxlen=self._max_len)
 
         # C++ RiskManager state (synced on every kline)
@@ -89,22 +94,23 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
                 for each closed bar.
         """
         self._on_bar_callback = on_bar_callback
-        if self._do_warmup:
-            self._warmup_buffer()
         self._client.start_listening()
 
     # -- Warmup -------------------------------------------------------------
 
-    def warmup(self) -> None:
-        """Public warmup (can be called before start())."""
-        self._warmup_buffer()
+    def warmup(self) -> list:
+        """Public warmup (can be called before start()); returns the fetched bars."""
+        return self._warmup_buffer()
 
-    def _warmup_buffer(self) -> None:
+    def _warmup_buffer(self) -> list:
         """
         Fetch historical 1m klines from Binance REST to pre-fill the
         Donchian channel buffer. Eliminates cold-start waiting period.
+
+        Returns the fetched bars (as dicts) so the caller can also feed them
+        into the streaming indicators.
         """
-        window_size = max(self._entry_period, self._atr_period) + 1
+        window_size = self._warmup_period + 1
         fetch_limit = window_size + 5
 
         url = "https://fapi.binance.com/fapi/v1/klines"
@@ -121,16 +127,19 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
         except Exception as e:
             print(f"  [Warmup] REST fetch failed: {e}")
             print("    Starting cold — waiting for real-time bars...")
-            return
+            return []
 
         if not raw_klines:
             print("  [Warmup] REST returned empty klines array")
-            return
+            return []
 
         # Drop the still-forming (in-progress) candle
         closed = raw_klines[:-1] if len(raw_klines) > 1 else raw_klines
+        bars = []
         for k in closed:
-            self.kline_buffer.append(self._kline_from_rest(k, self.symbol))
+            bar = self._kline_from_rest(k, self.symbol)
+            self.kline_buffer.append(bar)
+            bars.append(bar)
 
         last_ct = self.kline_buffer[-1]["close_time"]
         last_dt = datetime.fromtimestamp(last_ct / 1000.0).strftime(
@@ -140,6 +149,7 @@ class BinanceZmqDataFeeder(LiveDataFeeder):
             f"  [Warmup] {len(closed)} bars buffered, "
             f"last closed @ {last_dt}"
         )
+        return bars
 
     # -- ZMQ callbacks ------------------------------------------------------
 
