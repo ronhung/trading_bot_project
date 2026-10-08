@@ -1,597 +1,459 @@
-# Trading Bot Project — BTCUSDT Turtle Trend-Following System
+# Trading Bot Project — BTCUSDT Quantitative Trading System
 
-A hybrid **C++ / Python** automated trading system built on a **unified 6-phase quant architecture** with ABC contracts, bracket-order execution, and YAML-driven strategy assembly.
+A hybrid **C++ / Python** automated trading system built on a **6-phase quant
+architecture** with ABC contracts, bracket-order execution, parameterized order
+execution, and YAML-driven strategy assembly.
 
-Pluggable strategy components (`trigger` / `labeler` / `sizer` / `risk_manager`) power everything. Indicator formulas are single-sourced in `research/indicator_spec.py`; one ML pipeline (`research/` → `core/strategy_wrapper.py`) bridges research to execution.
-
-| Mode | Engine | When to use |
-|------|--------|-------------|
-| **C++ Backtest** | `backtest_engine.exe` + Python `live_trend_bot.py` | Rehearse the exact live code path with friction costs |
-| **Live Trading** | `live_engine.exe` + Python `live_trend_bot.py` | Paper/live on Binance Testnet |
-| **Fast Research Backtest** | `research/backtest.py` (`lightweight_backtest()`) | Vectorized prototyping (~50-200x faster), parameter sweeps |
-
-### Strategy signals
-
-A strategy is assembled from pluggable objects (see §7 "Adding a new strategy"). The entry rule is a `BaseEventTrigger`:
-
-| Signal | Meaning |
-|--------|---------|
-| `1` | Open Long (e.g. close broke above the `entry_period`-bar high) |
-| `-1` | Open Short (e.g. close broke below the `entry_period`-bar low) |
-| `0` | No event |
+The split-brain design keeps a **Python "brain"** (research + entry detection)
+and a **C++ engine** (exit lifecycle + order execution). The only bridges between
+them are model weights, indicator formulas, and an execution spec — so a new
+strategy is a config change, not a code change to the engine.
 
 ---
 
-## 1. Quick Reference
+## Table of contents
 
-```bash
-# 1) Install deps + build C++
-pip install -r requirements.txt
-cd live_engine && mkdir build && cd build && cmake .. && cmake --build . --config Debug
-
-# 2) Download data
-cd ../../data && python download_binance_data.py --prepare-csv
-
-# 3) Research pipeline (YAML → dataset → model → evaluation)
-cd ../research && python pipeline_runner.py ../config/example_turtle_vol.yaml
-
-# 4) C++ Backtest — two terminals
-#    T1: cd live_strategy && python live_trend_bot.py --no-warmup
-#    T2: cd live_engine/build/Debug && backtest_engine.exe
-
-# 5) Live (Testnet) — two terminals
-#    T1: cd live_engine/build/Debug && live_engine.exe
-#    T2: cd live_strategy && python live_trend_bot.py
-```
-
-> 💻 **Windows shortcut:** `build.ps1` / `run_backtest.ps1` / `run_live.ps1` do the
-> build + two-terminal launch for you — see [§9 Convenience Scripts](#9-convenience-scripts).
+1. [Architecture at a glance](#architecture-at-a-glance)
+2. [Quick start](#quick-start)
+3. [Phase-by-phase guide](#phase-by-phase-guide)
+4. [Running a backtest / live (detailed)](#running-a-backtest--live-detailed)
+5. [Execution parameterization](#execution-parameterization)
+6. [Config files](#config-files)
+7. [Adding a new strategy](#adding-a-new-strategy)
+8. [Directory structure](#directory-structure)
+9. [Tests](#tests)
+10. [Convenience scripts](#convenience-scripts)
 
 ---
 
-## 2. Setup
+## Architecture at a glance
 
-### 2.1 Python dependencies
+```
+Phase 1-3  (Research, Python)          Phase 4-6 (Execution, Python + C++)
+─────────────────────────────────      ───────────────────────────────────
+[Trigger] → [Features] → [Labeler]     [Sizer] → [RiskManager]
+     │            │           │             │          │
+     └────────────┴───────┐   │             └────┬─────┘
+                          ▼   ▼                  ▼
+                   [build ML dataset]     [StrategyWrapper]
+                          │                     │
+                          ▼                     ▼
+                    ModelEvaluator          [OrderPayload]
+                          │                     │
+                          ▼                     ▼
+                  model.json + features.json    C++ engine (backtest / live)
+```
+
+| Phase | Name | Runs where | Question it answers |
+|-------|------|------------|---------------------|
+| 1 | Trigger | Python | *When* do we enter? |
+| 2 | Features + labeling | Python | *What* do we feed the model / how do we label? |
+| 3 | ML training | Python | *Does* the signal carry edge? |
+| 3b | Vectorized backtest | Python | *Is* it profitable before C++? |
+| 4 | Sizer + risk | Python (size) / C++ (authoritative) | *How much* do we risk? |
+| 5 | C++ backtest | C++ + Python (same code path as live) | *Does* it hold with friction costs? |
+| 6 | Live (Testnet) | C++ + Python | *Does* it trade for real? |
+
+### The two validated strategies
+
+| Strategy | Trigger (`trend_breakout`) | Frequency | ML filter | Config |
+|----------|---------------------------|-----------|-----------|--------|
+| **High-freq** | `entry_period=2160`, `trend_period=8640`, `trail=1080` | higher (~ weekly) | XGBoost classifier (`P(win) > threshold`) | `config/trend_breakout_highfreq.yaml` |
+| **Low-freq** | `entry_period=7200`, `trend_period=28800`, `trail=3600` | lower (~ monthly) | none | `config/trend_breakout_lowfreq.yaml` |
+
+Both are long-only trend-filtered Donchian breakouts (BTC's short side has no edge
+due to upward drift). The high-freq model is at
+`research/outputs/trend_breakout_highfreq_model.json` +
+`trend_breakout_highfreq_features.json`.
+
+---
+
+## Quick start
+
+### 1. Install Python deps
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Requirements: `pandas`, `numpy`, `xgboost`, `scipy`, `scikit-learn`, `pyyaml`, `pyzmq`, `requests`, `matplotlib`, `pyarrow`.
+Requirements: `pandas`, `numpy`, `xgboost`, `scipy`, `scikit-learn`, `pyyaml`,
+`pyzmq`, `requests`, `matplotlib`, `pyarrow`.
 
-### 2.2 Build the C++ engine
+### 2. Build the C++ engines
 
-```bash
-cd live_engine && mkdir build && cd build
-cmake ..
-cmake --build . --config Debug
+```powershell
+# Windows (MSYS2 UCRT64 toolchain required)
+.\build.ps1
 ```
 
-Produces `backtest_engine.exe` and `live_engine.exe` in `live_engine/build/Debug`. All C++ dependencies are fetched automatically by CMake `FetchContent`.
+Produces `live_engine/build_cmake/backtest_engine.exe` and `live_engine.exe`.
+(If PowerShell blocks `.ps1`, run `powershell -ExecutionPolicy Bypass -File build.ps1`.)
 
-### 2.3 Configuration — `shared/config.json`
-
-```json
-{
-  "api_key": "YOUR_BINANCE_TESTNET_API_KEY",
-  "secret_key": "YOUR_BINANCE_TESTNET_SECRET_KEY",
-  "zmq": { "market_feed_port": 5555, "signal_port": 5556 },
-  "database": { "path": "data/trading.db" },
-  "backtest": { "initial_balance": 100000.0, "fee_rate": 0.0005, "slippage_bps": 1.0 }
-}
-```
-
-### 2.4 Historical data
+### 3. Download historical data
 
 ```bash
 cd data && python download_binance_data.py --prepare-csv
 ```
 
-Outputs `data/historical_data/BTCUSDT_1m_full.parquet` (and `.csv` with `--prepare-csv`).
+Outputs `data/historical_data/BTCUSDT_1m_full.parquet` (Python) and
+`BTCUSDT_1m_full.csv` (C++ backtest engine).
+
+### 4. Run a backtest (Phase 5) — two terminals
+
+```powershell
+# Terminal 1 — Python brain (--no-warmup: C++ replays the CSV, no REST fetch)
+python live_strategy/live_trend_bot.py --config config/trend_breakout_highfreq.yaml --no-warmup
+
+# Terminal 2 — C++ backtest engine (prints the BACKTEST REPORT)
+cd live_engine/build_cmake
+backtest_engine.exe
+```
+
+### 5. Run live (Phase 6, Binance Testnet) — two terminals
+
+```powershell
+# Terminal 1 — C++ live engine
+cd live_engine/build_cmake
+live_engine.exe
+
+# Terminal 2 — Python brain (no --no-warmup: REST warmup pre-fills indicators)
+python live_strategy/live_trend_bot.py --config config/trend_breakout_highfreq.yaml
+```
+
+> ⚠️ Live places real (paper) orders on Binance Testnet using the API keys in
+> `shared/config.json`.
 
 ---
 
-## 3. Phase-by-Phase Developer Guide
+## Phase-by-phase guide
 
-### Architecture Overview
+### Phase 1 — Event trigger
 
-```
-Phase 1-3 (Research Pipeline)              Phase 4-6 (Execution Pipeline)
-─────────────────────────────────         ────────────────────────────────
-[Trigger] → [Features] → [Labeler]        [Sizer] → [RiskManager]
-     │            │           │                │          │
-     └────────────┴───────┐   │                └────┬─────┘
-                          ▼   ▼                     ▼
-                     [build_ml_dataset()]    [StrategyWrapper]
-                          │                        │
-                          ▼                        ▼
-                    [ModelEvaluator]          [OrderPayload]
-                    (train, IC, decile)            │
-                          │                        ▼
-                          ▼                  C++ Engine
-                 model.json + features.json   (backtest or live)
-```
+**Goal:** define *when* to enter, and prove the trigger's events beat a
+random-entry baseline of the same direction.
 
-**Key rule:** Research (Phase 1-3) and Execution (Phase 4-6) are decoupled. The **only** bridge: model weights + feature list files. No `research.*` imports in `core/` or `execution/`.
-
----
-
-### Phase 1: Event Trigger
-
-**Goal:** Define entry events. Filter market noise.
-
-| File | Role |
-|------|------|
-| `core/trigger.py` | `BaseEventTrigger` ABC |
-| `research/triggers/turtle_breakout.py` | `TurtleBreakoutTrigger` — 20-day Donchian breakout |
-
-```python
-from research.triggers.turtle_breakout import TurtleBreakoutTrigger
-
-trigger = TurtleBreakoutTrigger(
-    entry_period=28800,       # 20-day at 1m bars
-    atr_period=28800,
-    intensity_threshold=1.0,  # require ≥ 1.0 ATR breakout (Phase 3b best)
-    signed=True,
-)
-signals = trigger.generate_signals(df)  # pd.Series: 1=long, -1=short, 0=none
-```
-
-**Add a new trigger:** Subclass `BaseEventTrigger`, implement `generate_signals()`. Register in YAML. No core code changes.
-
-**Validate a trigger before labeling** (`research/trigger_analysis.py`): measure
-each event's forward outcome and compare it against a random-entry baseline of
-the same direction. The barrier you pick should mirror the strategy's eventual
-exit mechanism.
-
-```python
-from research.trigger_analysis import evaluate_trigger, analyze_trigger
-from research.labeling import FixedHorizonLabeler, TripleBarrierLabeler
-from research.triggers.adam_breakout import AdamBreakoutTrigger
-
-trigger = AdamBreakoutTrigger(period=43200)  # 30-day breakout at 1m
-
-# One barrier at a time
-evaluate_trigger(trigger, df, FixedHorizonLabeler(horizon=14400))
-evaluate_trigger(trigger, df,
-                 TripleBarrierLabeler(upper_barrier=0.05, lower_barrier=-0.02,
-                                      horizon=1440, barrier_mode="pct"))
-
-# Parameterized sweep — edit the grid, not the code
-analyze_trigger(trigger, df, mode="fixed_horizon",
-                horizons=(1440, 4320, 7200, 14400, 43200))
-analyze_trigger(trigger, df, mode="triple_barrier",
-                triple_grid=((0.02, -0.01, 1440), (0.05, -0.02, 1440)),
-                tb_mode="pct")
-```
-
-Both return per-side (`long` / `short`) stats plus `baseline_long` /
-`baseline_short` (random entries of the same direction). `mode` selects the
-barrier family; `horizons` / `triple_grid` are the only things to edit when
-your trading frequency changes.
-
----
-
-### Phase 2: Features & Labeling
-
-**Goal:** Lookahead-free features + supervised labels at event positions.
-
-| File | Role |
-|------|------|
-| `core/feature.py` | `BaseFeature` ABC — `compute(df, events)` / `compute_one(df, idx)` |
-| `core/labeler.py` | `BaseLabeler` ABC — `compute_labels(df, events)` |
-| `research/features.py` | `add_indicators()` + `VolumeRatioFeature`, `ATRFeature`, etc. |
-| `research/labeling.py` | `fixed_horizon_label()` + `FixedHorizonLabeler`, `TripleBarrierLabeler` |
-
-```python
-from research.features import add_indicators, VolumeRatioFeature, default_feature_set
-from research.labeling import FixedHorizonLabeler
-
-# Step A: Precompute indicators (ALL .shift(1) — zero lookahead guarantee)
-# `add_indicators` is the SINGLE SOURCE OF TRUTH for indicator periods;
-# feature classes are pure readers and never recompute them.
-df = add_indicators(raw_data, entry_period=28800, atr_period=28800,
-                    vol_period=1440, ma_period=288000)
-
-# Step B: Feature computation (no params — periods live in add_indicators)
-vol = VolumeRatioFeature()
-features_df = vol.compute(df, signals)           # batch: DataFrame
-feat_dict  = vol.compute_one(df, bar_index=150)  # live: dict
-
-# All 8 features at once
-features = default_feature_set()   # ATR + BreakoutIntensity + VolumeRatio + ...
-features_df = features.compute(df, signals)
-
-# Step C: Labeling
-labeler = FixedHorizonLabeler(horizon=14400)  # 10-day forward at 1m
-labels_df = labeler.compute_labels(df, signals)
-# y_norm = trade-side forward return / daily ATR (volatility-normalized)
-```
-
----
-
-### Phase 3: Signal Evaluation & ML Training
-
-**Goal:** Train XGBoost, evaluate Spearman IC + decile staircase.
-
-| File | Role |
-|------|------|
-| `research/pipeline_runner.py` | One-command: YAML → dataset → model → evaluation |
-| `research/dataset_builder.py` | `build_ml_dataset()` — raw klines → (X, y) |
-| `research/evaluator.py` | `ModelEvaluator` — IC, decile, AUC-ROC, train/save |
-| `config/example_turtle_vol.yaml` | Declares all components |
-
-**One-command:**
 ```bash
-python research/pipeline_runner.py config/example_turtle_vol.yaml
-# → research/outputs/turtle_vol_filter_model.json
-# → research/outputs/turtle_vol_filter_features.json
+python scripts/phase1_validate.py          # compare a couple of triggers on 2020-2023
 ```
 
-**Manual (notebooks):**
-```python
-from research.dataset_builder import build_ml_dataset
-from research.features import add_indicators, default_feature_set
-from research.triggers.turtle_breakout import TurtleBreakoutTrigger
-from research.labeling import FixedHorizonLabeler
-from research.evaluator import ModelEvaluator
+Trigger classes live in `research/triggers/` and subclass
+`core/trigger.py:BaseEventTrigger`. Each returns `{-1, 0, 1}` (short / none / long).
+`research/trigger_analysis.py:analyze_trigger()` measures each event's forward
+outcome against a random baseline across horizons.
 
-df = add_indicators(raw_data)
-trigger = TurtleBreakoutTrigger(entry_period=28800, atr_period=28800, signed=True)
-features = default_feature_set()
-labeler = FixedHorizonLabeler(horizon=14400)
+### Phase 2 — Features & labeling
 
-X, meta = build_ml_dataset(df, trigger, features, labeler)
-
-evaluator = ModelEvaluator()
-X_np, y_np, feature_names = evaluator.prepare_features(X)
-model = evaluator.train_model(X_np[:split], y_np[:split])
-
-y_pred = model.predict(X_np[split:])
-ic = evaluator.evaluate_rank_ic(y_np[split:], y_pred)
-decile = evaluator.evaluate_decile_spread(y_np[split:], y_pred)
-
-print(f"Spearman IC: {ic['ic']:.4f}  {'PASS' if ic['pass'] else 'FAIL'}")
-print(f"Decile spread: {decile['spread']:+.4f}  monotonic={decile['monotonic']}")
-
-evaluator.save("research/outputs", prefix="turtle_vol_filter")
-```
-
----
-
-### Phase 3b: Parameter Fine-Tuning
-
-**Goal:** Optimize entry/exit/risk params via fast vectorized sweep before C++ backtest.
+**Goal:** lookahead-free features + supervised labels at each event position.
 
 | File | Role |
 |------|------|
-| `research/phase3b_sweep.py` | One-command sweep: train (2020-2023) → validate (2024) |
-| `research/param_sweep.py` | `run_parameter_sweep()` — multiprocessing grid search |
-| `research/backtest.py` | `lightweight_backtest()` — ~50-200x faster than C++ |
-| `execution/sizers.py` | `VolatilityTargetingSizer` — ABC sizer |
-| `execution/risk_managers.py` | `MaxDrawdownRiskManager` — ABC risk |
+| `core/feature.py` | `BaseFeature` ABC |
+| `core/labeler.py` | `BaseLabeler` ABC (the "barrier") |
+| `research/features.py` | `add_indicators()` + feature classes |
+| `research/labeling.py` | `FixedHorizonLabeler`, `TripleBarrierLabeler`, `TrailingExitLabeler` |
 
-**One-command sweep** (48 combos: entry 10/20/30/40-day × atr_mult 3/4/5/6 × intensity 0/0.5/1.0):
+No standalone command — features/labeling are invoked by the Phase 3 scripts.
+
+### Phase 3 — ML training
+
+**Goal:** train XGBoost and check the IC / decile gates (Spearman IC > 0.02,
+monotonic decile spread).
+
 ```bash
-python research/phase3b_sweep.py
-# → Sweeps on TRAIN (2020-2023), validates top-5 on TEST (2024)
+python scripts/phase3_train.py            # demo run over candidate strategies
+python scripts/train_ml_highfreq.py       # trains the actual high-freq classifier
+#   → research/outputs/trend_breakout_highfreq_model.json + _features.json
 ```
 
-**Key finding:** `entry=28800` (20-day), `atr_mult=4.0`, `intensity=1.0` wins
-(train Sharpe 1.33 → test Sharpe 0.89). `intensity=1.0` beats the previous
-`0.5` — requiring ≥ 1×ATR breakout filters weak/fake breakouts.
+### Phase 3b — Vectorized backtest
 
-```python
-from research.param_sweep import run_parameter_sweep
-from research.backtest import lightweight_backtest
-from research.triggers.turtle_breakout import TurtleBreakoutTrigger
-from research.labeling import TurtleExitLabeler
-from execution.sizers import VolatilityTargetingSizer
-from execution.risk_managers import MaxDrawdownRiskManager
+**Goal:** a fast profit check before paying for a C++ backtest.
 
-param_grid = {
-    "entry_period": [10, 20, 40],
-    "atr_mult": [1.5, 2.0, 3.0, 4.0],
-    "risk_pct": [0.01, 0.02, 0.03],
-}
-
-def sweep_target(entry_period, atr_mult, risk_pct, raw_data):
-    trigger = TurtleBreakoutTrigger(
-        entry_period=entry_period, atr_period=entry_period, atr_mult=atr_mult, signed=True,
-    )
-    exit_labeler = TurtleExitLabeler(
-        exit_period=entry_period // 2, atr_period=entry_period, atr_mult=atr_mult,
-    )
-    sizer = VolatilityTargetingSizer(risk_pct=risk_pct)
-    risk = MaxDrawdownRiskManager(max_dd_pct=0.05)
-    return lightweight_backtest(
-        raw_data, trigger=trigger, exit_labeler=exit_labeler,
-        indicator_params={"entry_period": entry_period, "exit_period": entry_period // 2,
-                          "atr_period": entry_period},
-        position_sizer=sizer, risk_manager=risk,
-    )
-
-results = run_parameter_sweep(sweep_target, param_grid, raw_data=df,
-                               n_jobs=-1, rank_by="sharpe")
-# Top result → write into config/live_strategy.yaml
+```bash
+python scripts/phase3b_backtest.py        # lightweight_backtest() over train/test
 ```
 
----
+`research/backtest.py:lightweight_backtest()` is ~50-200× faster than C++ and
+used for parameter sweeps. It does **not** model fees/slippage/execution — that is
+Phase 5's job.
 
-### Phase 4: Portfolio & Risk
+### Phase 4 — Position sizing & risk
 
-**Goal:** Position sizing + risk gates. Isolated from order execution.
+**Goal:** how much to risk per trade, and the risk gates.
 
 | File | Role |
 |------|------|
 | `core/position_sizer.py` | `BasePositionSizer` ABC |
 | `core/risk_manager.py` | `BaseRiskManager` ABC |
-| `execution/sizers.py` | `VolatilityTargetingSizer` — Turtle N-value |
+| `execution/sizers.py` | `FixedRiskSizer`, `VolatilityTargetingSizer` |
 | `execution/risk_managers.py` | `MaxDrawdownRiskManager`, `LivePositionGate` |
 
-```yaml
-# config/live_strategy.yaml — YAML assembly, no code changes needed
-position_sizer:
-  type: "execution.sizers.VolatilityTargetingSizer"
-  params: { risk_pct: 0.01, max_leverage: 20.0 }
-risk_manager:
-  type: "execution.risk_managers.MaxDrawdownRiskManager"
-  params: { max_dd_pct: 0.05 }
+> Note: in the live/backtest path, the **C++ `RiskManager` is authoritative** for
+> size — Python computes a provisional size only to decide whether to send the
+> signal; C++ recomputes the actual quantity from `risk_pct` / `max_leverage`.
+
+### Phase 5 — C++ backtest (same code path as live)
+
+**Goal:** full historical replay with fee + slippage, through the exact live path.
+
+```powershell
+python live_strategy/live_trend_bot.py --config config/trend_breakout_highfreq.yaml --no-warmup
+cd live_engine/build_cmake && backtest_engine.exe
 ```
 
-```python
-# Manual instantiation
-from execution.sizers import VolatilityTargetingSizer
-from execution.risk_managers import MaxDrawdownRiskManager, LivePositionGate
+The C++ engine replays `data/historical_data/BTCUSDT_1m_full.csv`, publishes each
+bar to Python over ZMQ, Python decides entries, C++ executes and manages the
+bracket exit. Fee/slippage come from `shared/config.json` (see
+[Config files](#config-files)).
 
-sizer = VolatilityTargetingSizer(risk_pct=0.01, max_leverage=20.0)
-size = sizer.calculate_size(2.0, 500.0, 10000.0, 42000.0)
-# = floor(min(equity*1%/stop_dist, equity*20/entry) / 0.001) * 0.001
+### Phase 6 — Live incubation (Binance Testnet)
 
-MaxDrawdownRiskManager(max_dd_pct=0.05).check_risk_limits({"current_drawdown": 0.03})  # True
-LivePositionGate().check_risk_limits({"current_position": 0.0})  # True
+**Goal:** the same code trading live on Testnet. Identical to Phase 5 except the
+data source (real-time WS) and the REST warmup.
+
+```powershell
+cd live_engine/build_cmake && live_engine.exe
+python live_strategy/live_trend_bot.py --config config/trend_breakout_highfreq.yaml
 ```
 
 ---
 
-### Phase 5: Robust Backtesting (C++ Engine + StrategyWrapper)
+## Running a backtest / live (detailed)
 
-**Goal:** Full historical backtest with friction costs. Same code path as live.
+The Python brain is `live_strategy/live_trend_bot.py`. It supports either a YAML
+config (recommended) or individual CLI flags.
 
-| File | Role |
-|------|------|
-| `core/strategy_wrapper.py` | Loads model, computes signals via the injected `trigger`, emits `OrderPayload` |
-| `core/order_payload.py` | Bracket order data contract |
-| `research/indicator_spec.py` | `ROLLING_SPEC` — single source of truth for indicator formulas |
-| `live_strategy/zmq_feeder.py` | ZMQ → buffer → callback |
-| `live_strategy/zmq_gateway.py` | Sends `OrderPayload` to C++ |
-| `live_strategy/live_trend_bot.py` | Composition shell |
+### `--config` (recommended)
 
-```bash
-# Terminal 1 — Python
+```powershell
+python live_strategy/live_trend_bot.py --config config/trend_breakout_highfreq.yaml --no-warmup
+```
+
+`--config` reads the **same YAML** the research pipeline uses — trigger, periods,
+model, and execution all in one file. This is the "one file per strategy" workflow:
+switching strategies is a config change, never a code change.
+
+### Without `--config` (CLI flags)
+
+```powershell
 python live_strategy/live_trend_bot.py --no-warmup \
-    --entry 28800 --exit 14400 --atr-period 28800 --atr-mult 4.0 --risk-pct 0.01 \
-    --model research/outputs/turtle_vol_filter_model.json \
-    --features research/outputs/turtle_vol_filter_features.json --threshold 0.0
-
-# Terminal 2 — C++
-cd live_engine/build/Debug && backtest_engine.exe
+  --trigger trend_breakout --period 2160 --trend-period 8640 --trail-period 1080 \
+  --classifier \
+  --model research/outputs/trend_breakout_highfreq_model.json \
+  --features research/outputs/trend_breakout_highfreq_features.json \
+  --threshold 0.5
 ```
 
-**Per-bar flow:**
-```
-C++ ZMQ PUB kline
-  → BinanceZmqDataFeeder (sync state, buffer, callback)
-    → StrategyWrapper.on_bar()
-        ├─ WAITING_CLOSE? → skip
-        ├─ risk_manager.check()? → blocked? → skip
-        ├─ trigger.generate_signals(ind)  ← injected entry rule
-        ├─ feature.compute_one() → ML predict → score > threshold?
-        ├─ sizer.calculate_size() → size
-        └─ OrderPayload(action, qty, price, stop, trailing_exit, period)
-          → BinanceZmqExecutionGateway.send_order() → ZMQ PUSH
-            → C++ executes entry + arms bracket orders
-              → stop/trailing exit triggers → ZMQ PUB position_closed
-                → StrategyWrapper.on_position_closed() → IDLE
-```
+Full flag list: run `python live_strategy/live_trend_bot.py --help`.
+
+### `--no-warmup` — what it means
+
+`--no-warmup` turns **off the REST warmup**. It is used only for the **C++
+backtest**.
+
+| | With `--no-warmup` (backtest) | Without (live) |
+|---|---|---|
+| Data source | C++ replays the CSV over ZMQ | Binance REST warmup + real-time WS |
+| Indicator warmup | indicators fill naturally as bars replay | REST pre-fills them so the first signal fires immediately |
+| kline printing | off (avoids slowing a multi-million-bar replay) | on (`📈 [Feeder] #N kline …`) |
+
+In **live**, the warmup window is `max(period, trail_period, trend_period)` — e.g.
+8640 bars (6 days) for high-freq, 28800 bars (20 days) for low-freq. Without warmup
+you would wait that long for the first signal.
+
+> `--no-warmup` does **not** mean "no warmup at all" — it means "don't warm from a
+> REST fetch". Indicators still warm; only the source changes.
 
 ---
 
-### Phase 6: Live Incubation
+## Execution parameterization
 
-**Goal:** Live Testnet. Same code as Phase 5. Only config differs.
+How an order is placed and how an unfilled order is handled is a strategy decision,
+so it lives in the strategy YAML (and travels with each order from Python to C++).
+There is no per-strategy execution code in C++.
 
-```bash
-# Terminal 1 — C++ live engine
-cd live_engine/build/Debug && live_engine.exe
-
-# Terminal 2 — Python (same params, no --no-warmup)
-python live_strategy/live_trend_bot.py \
-    --entry 28800 --exit 14400 --atr-period 28800 --atr-mult 4.0 --risk-pct 0.01 \
-    --model research/outputs/turtle_vol_filter_model.json \
-    --features research/outputs/turtle_vol_filter_features.json --threshold 0.0
+```yaml
+execution:
+  entry:
+    order_type: market          # market | limit | limit_maker
+    time_in_force: gtc          # gtc | ioc | fok | gtx   (limit orders only)
+    timeout_ms: 0               # 0 = never chase (correct for market)
+    unfilled_policy: cancel     # cancel | reprice | market
+    max_reprice_attempts: 2     # only used by reprice
+  exit:
+    order_type: market          # stops should be aggressive
+    time_in_force: gtc
+    timeout_ms: 3000
+    unfilled_policy: market     # if the stop close doesn't fill, hard-eat at market
+    max_reprice_attempts: 2
 ```
 
-`BinanceZmqDataFeeder` / `BinanceZmqExecutionGateway` implement `LiveDataFeeder` / `LiveExecutionGateway` ABCs. `StrategyWrapper` is identical to Phase 5 — guaranteeing 100% logic parity.
+Field meanings:
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| `order_type` | `market` / `limit` / `limit_maker` | `limit_maker` = post-only (GTX) |
+| `time_in_force` | `gtc` / `ioc` / `fok` / `gtx` | only applies to limit orders |
+| `timeout_ms` | int | how long an open order may sit before `unfilled_policy` fires |
+| `unfilled_policy` | `cancel` / `reprice` / `market` | on timeout: give up / chase (re-price) / hard-eat at market |
+| `max_reprice_attempts` | int | chase re-prices before giving up |
+
+Defaults (aggressive, right for breakout): **entry = market**, **exit = market with
+a 3 s timeout → market**. A mean-reversion or maker-rebate strategy would override
+to `limit` / `limit_maker` + `reprice`.
+
+> **Breakout + limit = adverse selection.** A resting limit on a breakout only
+> fills when price comes back (the weak breakout) and misses the strong ones that
+> run away. Use `market` for momentum entries.
 
 ---
 
-## 4. Bracket Order Protocol
+## Config files
 
-Python handles **entry only**. C++ owns the exit lifecycle.
+### `config/*.yaml` — strategy definition (research + live)
 
+One file per strategy. Declares `trigger`, `indicators`, `features`, `labeler`,
+`model` (optional), and `execution`:
+
+```yaml
+trigger:
+  type: "research.triggers.trend_breakout.TrendFilteredBreakoutTrigger"
+  params: { entry_period: 2160, trend_period: 8640, long_only: true }
+indicators: { entry_period: 2160, exit_period: 1080, atr_period: 2160, ma_period: 8640 }
+features: [ ... ]
+labeler: { type: "research.labeling.TrailingExitLabeler", params: { trail_period: 1080 } }
+model: { type: "xgboost_classifier", output_prefix: "trend_breakout_highfreq" }
+execution: { entry: { ... }, exit: { ... } }
 ```
-   IDLE                          WAITING_CLOSE
-   ┌──────────┐                  ┌──────────────┐
-   │ detecting│──OrderPayload──→ │ entry paused │
-   │ entries  │                  │ C++ manages  │
-   │          │←─POSITION_CLOSED─│ exit full    │
-   └──────────┘                  └──────────────┘
-```
 
-**OrderPayload** (`core/order_payload.py`): `action`, `symbol`, `quantity`, `entry_price`, `hard_stop_loss`, `trailing_exit_indicator`, `trailing_exit_period`, `take_profit` (optional).
+### `shared/config.json` — API keys + ports + backtest costs
 
----
-
-## 5. IPC Protocol (C++ ↔ Python over ZMQ)
-
-| Direction | Pattern | Port | Content |
-|-----------|---------|------|---------|
-| C++ → Python | PUB | 5555 | `kline`, `order_update`, `position_closed` |
-| Python → C++ | PULL | 5556 | order signals + `ack` |
-
-**position_closed** (new bracket-order message):
 ```json
-{"type":"position_closed", "symbol":"BTCUSDT", "reason":"stop_loss",
- "entry_price":42100.0, "exit_price":41800.0, "pnl":-37.0}
+{
+  "api_key": "…", "secret_key": "…",
+  "zmq": { "market_feed_port": 5555, "signal_port": 5556 },
+  "backtest": {
+    "initial_balance": 100000.0,
+    "fee_rate": 0.0005,
+    "slippage_bps": 1.0,
+    "risk_pct": 0.01,
+    "max_leverage": 20.0
+  }
+}
 ```
+
+`fee_rate` (per side) and `slippage_bps` (per side) are read by the C++ backtest —
+change them here to reprice friction costs without rebuilding.
 
 ---
 
-## 6. Directory Structure
+## Adding a new strategy
+
+A strategy is a set of **pluggable objects** wired together. You write (or reuse)
+components; you never edit the engine.
+
+### The pluggable objects
+
+| Object | ABC | Write / edit | File |
+|--------|-----|--------------|------|
+| Trigger (entry) | `BaseEventTrigger.generate_signals()` | usually write | `research/triggers/<name>.py` |
+| Labeler (barrier / exit) | `BaseLabeler.compute_labels()` | usually write | `research/labeling.py` |
+| Feature set (ML input) | `BaseFeature.compute()` / `compute_one()` | usually reuse | `research/features.py` |
+| Sizer (size) | `BasePositionSizer.calculate_size()` | usually reuse | `execution/sizers.py` |
+| Risk manager (gate) | `BaseRiskManager.check_risk_limits()` | usually reuse | `execution/risk_managers.py` |
+| Execution spec | — | config | `config/<name>.yaml` `execution:` block |
+
+### The three research → execution bridges
+
+Only three artifacts cross from research into execution:
+
+1. **Model + feature list** — `model.json` + `features.json` (the ML filter).
+2. **Indicator formulas** — `research/indicator_spec.py` `ROLLING_SPEC` is the single
+   source of truth; both the vectorized `add_indicators` and the streaming
+   `IncrementalIndicators` interpret it.
+3. **Execution spec** — the `execution:` block in the strategy YAML, serialized into
+   `OrderPayload` and honored by C++.
+
+### Checklist
+
+1. **Write the trigger** — a new `BaseEventTrigger` in `research/triggers/`.
+2. **Write the labeler** (the barrier) — a new `BaseLabeler` in
+   `research/labeling.py`. This drives research labeling *and*
+   `lightweight_backtest`.
+3. **Add indicators if needed** — one line in `ROLLING_SPEC`
+   (`research/indicator_spec.py`); both backends pick it up automatically.
+4. **C++ exit** — if your exit is in the fixed set (fixed stop / trailing
+   Donchian low·high / MA), set `bracket`/`trailing_exit_indicator` in config — **no
+   C++ change**. If it's a brand-new exit mechanism, add one branch in
+   `live_engine/src/core/trailing_stop.cpp` and rebuild.
+5. **Set the execution spec** — `execution:` block in the YAML (or `--exec-*` flags).
+6. **Wire it in config** — point `trigger` / `features` / `labeler` / `model` /
+   `execution` at your components in `config/<name>.yaml`.
+7. **Validate** — Phase 1 (trigger) → Phase 3 (ML) → Phase 3b (vectorized) → Phase 5
+   (C++ backtest).
+
+---
+
+## Directory structure
 
 ```
-core/                          ABC contracts (Phase 1-6)
-  trigger.py, feature.py, labeler.py,
-  position_sizer.py, risk_manager.py,
-  order_payload.py, strategy_wrapper.py,
-  data_feeder.py, execution_gateway.py
+core/                          ABC contracts + the execution data contract
+  trigger.py  feature.py  labeler.py            (Phase 1-3 ABCs)
+  position_sizer.py  risk_manager.py            (Phase 4 ABCs)
+  order_payload.py  execution_spec.py           (Python → C++ order + execution)
+  strategy_wrapper.py  data_feeder.py  execution_gateway.py
 execution/                     Concrete sizers + risk managers
-  sizers.py, risk_managers.py
+  sizers.py  risk_managers.py
 research/                      Research toolkit (Phase 1-3)
-  triggers/turtle_breakout.py  TurtleBreakoutTrigger
-  features.py                  add_indicators() + 8 feature classes
-  labeling.py                  labelers + BaseLabeler classes
-  dataset_builder.py           build_ml_dataset() (ABCs + legacy)
-  backtest.py                  lightweight_backtest()
-  param_sweep.py               run_parameter_sweep()
-  evaluator.py                 ModelEvaluator
-  pipeline_runner.py           YAML-driven DI runner
-  outputs/                     X_*.parquet, model.json, features.json
+  triggers/                    BaseEventTrigger implementations
+  features.py  features_incremental.py          (vectorized + streaming indicators)
+  indicator_spec.py            ROLLING_SPEC — single source of truth
+  labeling.py  dataset_builder.py  evaluator.py  backtest.py
+  trigger_analysis.py  param_sweep.py  pipeline_runner.py
+  outputs/                     model.json + features.json artifacts
 live_strategy/                 Execution layer (Phase 5-6)
-  zmq_client.py                BinanceZmqClient (unchanged)
-  zmq_feeder.py                BinanceZmqDataFeeder
-  zmq_gateway.py               BinanceZmqExecutionGateway
-  live_trend_bot.py            Composition shell
+  live_trend_bot.py            composition shell + --config + CLI
+  zmq_client.py  zmq_feeder.py  zmq_gateway.py
 config/                        YAML strategy assembly
-shared/                        config.json (ZMQ ports, API keys, backtest risk)
-live_engine/                   C++ engine (unchanged)
-data/                          Data pipeline
-tests/                         Unit + parity tests
-requirements.txt
+shared/                        config.json (keys, ports, backtest costs)
+live_engine/                   C++ engine
+  src/core/                    risk manager, trailing stop, IPC, executor interface
+  src/backtest/                CSV replayer + mock executor
+  src/live/                    Binance WS + live executor + order tracker
+scripts/                       Phase 1/3/3b run scripts
+tests/                         unit + parity tests
 ```
 
 ---
 
-## 7. Dependencies
-
-**Python:** `pandas`, `numpy`, `xgboost`, `scipy`, `scikit-learn`, `pyyaml`, `pyzmq`, `requests`, `matplotlib`, `pyarrow`  
-Install: `pip install -r requirements.txt`
-
-**C++:** nlohmann/json, IXWebSocket, libzmq + cppzmq, cpp-httplib, OpenSSL (CMake FetchContent)  
-**System:** CMake ≥ 3.14, C++17, OpenSSL headers
-
----
-
-## 8. Running Tests
+## Tests
 
 ```bash
-python -m research.features         # indicator precompute + zero-lookahead
-python -m research.labeling         # triple-barrier cross-validation
-python -m research.dataset_builder  # build_ml_dataset() demo
-python -m research.backtest         # lightweight_backtest() demo
-
-python tests/test_parity.py              # ABC ↔ legacy parity
-python tests/test_order_payload.py       # OrderPayload dataclass
-python tests/test_strategy_wrapper.py    # StrategyWrapper state machine
+python tests/test_order_payload.py          # OrderPayload + execution spec
+python tests/test_strategy_wrapper.py       # StrategyWrapper state machine
+python tests/test_parity.py                 # ABC ↔ legacy parity
+python tests/test_trailing_stop_parity.py   # C++ trailing stop ↔ Python labeler
 ```
 
 ---
 
-## 9. Convenience Scripts
+## Convenience scripts
 
-Three PowerShell scripts in the repo root wrap the build + two-terminal flows
-so you don't have to hand-type the commands or manage the MSYS2/Python
-environment. They assume MSYS2 UCRT64 at `C:\msys64` (override via
-`$env:MSYS2_ROOT`).
+PowerShell helpers in the repo root wrap the build + two-terminal flows.
 
 | Script | Purpose |
 |--------|---------|
-| `build.ps1` | Rebuild `live_engine.exe` + `backtest_engine.exe` (CMake + Ninja) and bundle runtime DLLs next to the exe. |
-| `run_backtest.ps1` | Phase 5 — launch the Python brain (`--no-warmup`) + `backtest_engine.exe` in two windows. |
-| `run_live.ps1` | Phase 6 — launch the Python brain + `live_engine.exe` in two windows (live on Binance Testnet). |
+| `build.ps1` | Rebuild `live_engine.exe` + `backtest_engine.exe` (CMake + Ninja). |
+| `run_backtest.ps1` | Launch Python brain + `backtest_engine.exe` in two windows. |
+| `run_live.ps1` | Launch Python brain + `live_engine.exe` in two windows. |
 
 ```powershell
-cd <repo root>
-
-# Rebuild the C++ engines (first time, or after editing C++)
 .\build.ps1
-
-# Phase 5 backtest — the engine window prints the BACKTEST REPORT
-.\run_backtest.ps1
-
-# Phase 6 live (Testnet) — real paper orders
-.\run_live.ps1
+.\run_backtest.ps1     # or .\run_live.ps1
 ```
 
-Details baked into the scripts:
-
-- `build.ps1` configures with `-DZMQ_HAVE_IPC=OFF` — libzmq's IPC path needs
-  POSIX `<sys/socket.h>`, which MinGW lacks. It also prepends
-  `C:\msys64\ucrt64\bin` to `PATH` so the compiler finds its runtime DLLs.
-- The `run_*.ps1` scripts set `PYTHONUTF8=1` (emoji logs otherwise crash on
-  Chinese-locale Windows cp950), resolve the miniconda Python, and open each
-  process in a `cmd /k` window so the backtest report stays visible.
-- Scripts output engines to `live_engine/build_cmake/` (not `build/Debug/`).
-
-If PowerShell blocks `.ps1`, run `powershell -ExecutionPolicy Bypass -File build.ps1`.
-
----
-
-## 10. Adding a New Strategy
-
-A strategy is a set of **pluggable objects** wired together — you never edit the
-engine or the framework, you write (or reuse) components.
-
-### The 5 pluggable objects
-
-| Object | ABC | What it does | Write it? |
-|--------|-----|--------------|-----------|
-| Trigger (entry) | `BaseEventTrigger.generate_signals()` | returns `{-1,0,1}` events | usually yes |
-| Labeler (exit / barrier) | `BaseLabeler.compute_labels()` | per-event `exit_idx` / `exit_price` / `label` | usually yes |
-| Feature set (ML input) | `BaseFeature.compute()` / `compute_one()` | feature vector per event | often reuse |
-| Sizer (size) | `BasePositionSizer.calculate_size()` | signal context → contract size | usually reuse |
-| Risk manager (gate) | `BaseRiskManager.check_risk_limits()` | `False` blocks entries | usually reuse |
-
-Reusable implementations: `research/triggers/` (Adam / Turtle breakouts),
-`research/labeling.py` (TripleBarrier / FixedHorizon / TrailingExit /
-TurtleExit), `execution/sizers.py`, `execution/risk_managers.py`.
-
-### The two research ↔ execution bridges
-
-Only two artifacts cross from research (Phase 1-3) into execution (Phase 4-5):
-
-1. **Model + feature list** — `model.json` + `features.json` (the ML filter).
-2. **Indicator formulas** — `research/indicator_spec.py` `ROLLING_SPEC` is the
-   single source of truth; both the vectorized `add_indicators` and the
-   streaming `IncrementalIndicators` are thin interpreters of it.
-
-### Checklist for a new strategy
-
-1. **Write the trigger** — a new `BaseEventTrigger` in `research/triggers/`.
-2. **Write the labeler** (the "barrier") — a new `BaseLabeler` in
-   `research/labeling.py`. This is the exit rule used for research labeling +
-   `lightweight_backtest`.
-3. **Add indicators if needed** — one line in `ROLLING_SPEC`; both backends
-   pick it up automatically. (New input transforms go in `indicator_spec.py`.)
-4. **C++ exit** — if your exit is in the fixed rule set (fixed stop / trailing
-   Donchian low·high / MA), set `bracket.trailing_exit_indicator` in config —
-   **no C++ change**. If it's a brand-new exit mechanism, add one `else if`
-   branch in `live_engine/src/core/trailing_stop.cpp` and rebuild.
-5. **Wire it in config** — point the `trigger` / `features` / `position_sizer`
-   / `risk_manager` / `bracket` sections at your components.
-6. **Run Phase 3** to train the ML filter (or run without it), then Phase 5
-   backtest to validate.
-
-The framework itself never needs editing — triggers, labelers, sizers, and risk
-managers are dependency-injected, and indicator formulas are declarative.
+> ⚠️ `run_backtest.ps1` / `run_live.ps1` currently launch the brain with
+> `--no-warmup` and **no strategy flags** (the default Adam strategy). To run a
+> specific strategy through them, either edit the script to pass
+> `--config config/<name>.yaml`, or run the two terminals manually as shown in
+> [Quick start](#quick-start).
