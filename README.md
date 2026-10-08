@@ -80,13 +80,18 @@ Requirements: `pandas`, `numpy`, `xgboost`, `scipy`, `scikit-learn`, `pyyaml`,
 
 ### 2. Build the C++ engines
 
+The C++ engines are built by `build.ps1`, which drives CMake + Ninja and bundles
+the runtime DLLs next to the `.exe` files.
+
 ```powershell
-# Windows (MSYS2 UCRT64 toolchain required)
 .\build.ps1
 ```
 
-Produces `live_engine/build_cmake/backtest_engine.exe` and `live_engine.exe`.
-(If PowerShell blocks `.ps1`, run `powershell -ExecutionPolicy Bypass -File build.ps1`.)
+- **Requires MSYS2 UCRT64** at `C:\msys64` (override the path with `$env:MSYS2_ROOT`).
+- Produces `live_engine/build_cmake/backtest_engine.exe` and `live_engine.exe`.
+- **Re-run it after editing any C++** (`.cpp` / `.h`) under `live_engine/src/` —
+  Python-only and config changes never need a rebuild.
+- If PowerShell blocks `.ps1`: `powershell -ExecutionPolicy Bypass -File build.ps1`.
 
 ### 3. Download historical data
 
