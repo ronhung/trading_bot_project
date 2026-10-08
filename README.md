@@ -22,7 +22,6 @@ strategy is a config change, not a code change to the engine.
 7. [Adding a new strategy](#adding-a-new-strategy)
 8. [Directory structure](#directory-structure)
 9. [Tests](#tests)
-10. [Convenience scripts](#convenience-scripts)
 
 ---
 
@@ -434,26 +433,3 @@ python tests/test_strategy_wrapper.py       # StrategyWrapper state machine
 python tests/test_parity.py                 # ABC ↔ legacy parity
 python tests/test_trailing_stop_parity.py   # C++ trailing stop ↔ Python labeler
 ```
-
----
-
-## Convenience scripts
-
-PowerShell helpers in the repo root wrap the build + two-terminal flows.
-
-| Script | Purpose |
-|--------|---------|
-| `build.ps1` | Rebuild `live_engine.exe` + `backtest_engine.exe` (CMake + Ninja). |
-| `run_backtest.ps1` | Launch Python brain + `backtest_engine.exe` in two windows. |
-| `run_live.ps1` | Launch Python brain + `live_engine.exe` in two windows. |
-
-```powershell
-.\build.ps1
-.\run_backtest.ps1     # or .\run_live.ps1
-```
-
-> ⚠️ `run_backtest.ps1` / `run_live.ps1` currently launch the brain with
-> `--no-warmup` and **no strategy flags** (the default Adam strategy). To run a
-> specific strategy through them, either edit the script to pass
-> `--config config/<name>.yaml`, or run the two terminals manually as shown in
-> [Quick start](#quick-start).
