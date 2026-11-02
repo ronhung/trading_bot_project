@@ -21,6 +21,7 @@ set(USE_MBED_TLS OFF CACHE BOOL "Disable mbedtls" FORCE)
 set(USE_OPEN_SSL ON CACHE BOOL "Enable OpenSSL" FORCE)
 
 include(FetchContent)
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL 'offline' FORCE)
 
 message(STATUS "Fetching nlohmann/json...")
 FetchContent_Declare(json

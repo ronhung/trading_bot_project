@@ -6,8 +6,6 @@
 
 using json = nlohmann::json;
 
-// Parse a Python ExecutionSpec dict into the C++ struct. Defaults mirror
-// Python's ExecutionSpec (aggressive market entry).
 static ExecutionSpec parse_execution(const json& j) {
     ExecutionSpec spec;
     if (!j.is_object()) return spec;
@@ -17,6 +15,16 @@ static ExecutionSpec parse_execution(const json& j) {
     spec.unfilled_policy = j.value("unfilled_policy", "CANCEL");
     spec.max_reprice_attempts = j.value("max_reprice_attempts", 2);
     return spec;
+}
+
+static json parse_incoming(const zmq::message_t& msg) {
+    if (msg.size() == 0) return json::object();
+    const char* c_ptr = static_cast<const char*>(msg.data());
+    if (c_ptr[0] == '{' || c_ptr[0] == '[') {
+        return json::parse(c_ptr, c_ptr + msg.size());
+    }
+    const uint8_t* u_ptr = reinterpret_cast<const uint8_t*>(c_ptr);
+    return json::from_msgpack(u_ptr, u_ptr + msg.size());
 }
 
 IpcServer::IpcServer(int pub_port, int pull_port,
@@ -32,7 +40,7 @@ IpcServer::IpcServer(int pub_port, int pull_port,
 {
     std::string pub_addr = "tcp://*:" + std::to_string(pub_port);
     publisher.bind(pub_addr);
-    std::cout << "📡 [IPC] Market publisher (PUB) bound to: " << pub_addr << std::endl;
+    std::cout << "📡 [IPC] Market publisher (PUB/MessagePack) bound to: " << pub_addr << std::endl;
 
     std::string pull_addr = "tcp://*:" + std::to_string(pull_port);
     receiver.bind(pull_addr);
@@ -44,8 +52,6 @@ IpcServer::IpcServer(int pub_port, int pull_port,
         rx_thread = std::thread(&IpcServer::receive_loop, this);
     }
 
-    // Wire the executor's order status callback to our thread-safe queue.
-    // (MockExecutor's default is a no-op, so backtest is unaffected.)
     if (executor_) {
         executor_->set_order_status_callback([this](const OrderStatusUpdate& u) {
             queue_order_update(u);
@@ -86,20 +92,15 @@ void IpcServer::publish_kline(const KLineData& kline) {
     j["trades_count"] = kline.trades_count;
     j["is_closed"] = kline.is_closed;
 
-    // Inject real RiskManager state so Python brain knows actual position
     j["current_position"]  = risk_manager_ ? risk_manager_->get_current_position() : 0.0;
     j["available_balance"] = risk_manager_ ? risk_manager_->get_current_balance()   : 0.0;
     j["stop_price"]        = risk_manager_ ? risk_manager_->get_stop_price()        : 0.0;
 
-    std::string message = j.dump();
-    zmq::message_t zmq_msg(message.begin(), message.end());
+    std::vector<uint8_t> packed = json::to_msgpack(j);
+    zmq::message_t zmq_msg(packed.data(), packed.size());
     publisher.send(zmq_msg, zmq::send_flags::none);
 }
 
-// ---------------------------------------------------------------------------
-// Thread-safe order update queue → PUB socket
-// Called from any thread; actual PUB send only from main-loop via pump.
-// ---------------------------------------------------------------------------
 void IpcServer::queue_order_update(const OrderStatusUpdate& u) {
     json j;
     j["type"] = "order_update";
@@ -114,13 +115,13 @@ void IpcServer::queue_order_update(const OrderStatusUpdate& u) {
     j["reduce_only"] = u.reduce_only;
     j["filled_quantity"] = u.filled_quantity;
     j["reason"] = u.reason;
-    order_update_queue_.push(j.dump());
+    order_update_queue_.push(json::to_msgpack(j));
 }
 
 void IpcServer::pump_order_updates() {
-    std::string msg;
+    std::vector<uint8_t> msg;
     while (order_update_queue_.try_pop(msg)) {
-        zmq::message_t zmq_msg(msg.begin(), msg.end());
+        zmq::message_t zmq_msg(msg.data(), msg.size());
         publisher.send(zmq_msg, zmq::send_flags::none);
     }
 }
@@ -135,13 +136,12 @@ bool IpcServer::recv_until_ack(int timeout_ms) {
         if (!res) {
             continue;
         }
-        std::string msg_str(static_cast<char*>(request.data()), request.size());
         try {
-            json j = json::parse(msg_str);
+            json j = parse_incoming(request);
             if (j.value("type", "") == "ack") {
                 return true;
             }
-            handle_message(msg_str);
+            handle_json(j);
         } catch (const std::exception& e) {
             std::cerr << "Failed to parse Python message: " << e.what() << std::endl;
         }
@@ -167,7 +167,7 @@ bool IpcServer::wait_for_python(int timeout_ms) {
     ping.taker_buy_base = 0.0;
     ping.taker_buy_quote = 0.0;
     ping.trades_count = 0;
-    ping.is_closed = false; // warmup only — strategy ignores non-closed bars
+    ping.is_closed = false;
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -181,9 +181,7 @@ bool IpcServer::wait_for_python(int timeout_ms) {
     return false;
 }
 
-void IpcServer::handle_message(const std::string& msg_str) {
-    json j = json::parse(msg_str);
-
+void IpcServer::handle_json(const json& j) {
     if (j.value("type", "") == "ack") {
         return;
     }
@@ -199,7 +197,6 @@ void IpcServer::handle_message(const std::string& msg_str) {
         trailing_period = j["trailing_exit"].value("period", 0);
     }
 
-    // Execution spec for this order (entry) + the exit close that will follow.
     ExecutionSpec entry_exec;
     ExecutionSpec exit_exec;
     if (j.contains("execution") && j["execution"].is_object()) {
@@ -223,7 +220,6 @@ void IpcServer::handle_message(const std::string& msg_str) {
     }
 
     if (action == "BUY" || action == "SELL") {
-        // One-position rule: refuse to pyramid / flip without an explicit CLOSE_*.
         double cur_pos = risk_manager_->get_current_position();
         if (RiskManager::is_effective_position(cur_pos)) {
             std::cout << "🚫 [IPC] Already in position (" << cur_pos
@@ -231,7 +227,6 @@ void IpcServer::handle_message(const std::string& msg_str) {
             return;
         }
 
-        // Also refuse if there's already a pending open order
         if (executor_->has_open_order()) {
             std::cout << "🚫 [IPC] Open order already pending; ignore duplicate open." << std::endl;
             return;
@@ -265,9 +260,6 @@ void IpcServer::handle_message(const std::string& msg_str) {
             std::cout << "🧭 [IPC] Verified exchange position for " << symbol
                       << ": " << verified_pos << std::endl;
         } else {
-            // REST verify unavailable (transient network blip) — fall back to the
-            // RiskManager position, which ACCOUNT_UPDATE keeps in sync, rather
-            // than dropping the close command.
             verified_pos = risk_manager_->get_current_position();
             std::cout << "⚠️ [IPC] Exchange verify failed; using synced position "
                       << verified_pos << std::endl;
@@ -288,8 +280,6 @@ void IpcServer::handle_message(const std::string& msg_str) {
             close_side = "BUY";
         }
 
-        // Close the full position; step/quantity rounding is handled by the
-        // executor (place_order_internal), and reduceOnly prevents a flip.
         double close_quantity = std::abs(verified_pos);
         std::cout << "🛡️ [Close " << (action == "CLOSE_LONG" ? "Long" : "Short")
                   << "] qty=" << close_quantity << " | " << close_side << " + reduceOnly" << std::endl;
@@ -300,8 +290,6 @@ void IpcServer::handle_message(const std::string& msg_str) {
         req.quantity = close_quantity;
         req.price = price;
         req.reduce_only = true;
-        // Manual closes are aggressive: no execution travels with this legacy
-        // path, so default to MARKET reduce-only.
         req.execution.order_type = "MARKET";
 
         bool ok = executor_->send_order(req);
@@ -318,9 +306,9 @@ void IpcServer::receive_loop() {
         if (!res) {
             continue;
         }
-        std::string msg_str(static_cast<char*>(request.data()), request.size());
         try {
-            handle_message(msg_str);
+            json j = parse_incoming(request);
+            handle_json(j);
         } catch (const std::exception& e) {
             std::cerr << "Failed to parse Python command: " << e.what() << std::endl;
         }

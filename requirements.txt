@@ -24,3 +24,6 @@ matplotlib>=3.7
 
 # Parquet I/O (historical data)
 pyarrow>=14.0
+
+# Binary IPC serialization
+msgpack>=1.0

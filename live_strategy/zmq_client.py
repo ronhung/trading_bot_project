@@ -1,12 +1,14 @@
 import zmq
 import json
+import msgpack
 from datetime import datetime
 
 class BinanceZmqClient:
-    def __init__(self, host="localhost", sub_port=5555, push_port=5556):
+    def __init__(self, host="localhost", sub_port=5555, push_port=5556, use_msgpack=True):
         self.host = host
         self.sub_port = sub_port
         self.push_port = push_port
+        self.use_msgpack = use_msgpack
         self.context = zmq.Context()
         
         # 1. Market data listener (SUB)
@@ -19,34 +21,26 @@ class BinanceZmqClient:
         self.is_running = False
 
     def connect(self):
-        # connect the listener
         sub_address = f"tcp://{self.host}:{self.sub_port}"
         self.subscriber.connect(sub_address)
         self.subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
-        # Non-blocking receive window (ms). Without this, recv_string() blocks
-        # indefinitely and defers Ctrl+C until the next kline arrives (up to 1
-        # minute). With a short timeout the loop wakes up often, so KeyboardInterrupt
-        # is honored immediately and the process exits cleanly.
         self.subscriber.setsockopt(zmq.RCVTIMEO, 200)
         
-        # connect the sender
         push_address = f"tcp://{self.host}:{self.push_port}"
         self.commander.connect(push_address)
         
-        print(f"📻 [ZMQ Client] Market feed connected: {sub_address}")
-        print(f"🎯 [ZMQ Client] Command channel connected: {push_address}")
+        proto = "MessagePack" if self.use_msgpack else "JSON"
+        print(f"[Radio] [ZMQ Client] Market feed connected: {sub_address} ({proto})")
+        print(f"[Target] [ZMQ Client] Command channel connected: {push_address} ({proto})")
 
     def set_kline_callback(self, callback):
         self.kline_callback = callback
 
     def set_order_update_callback(self, callback):
-        """Callback for order status updates from C++ (FILLED, CANCELED, etc.)."""
         self.order_update_callback = callback
 
-    # [added] dedicated function to send order signals
     def send_order_signal(self, action: str, symbol: str, price: float, stop_price: float = 0.0,
                           trailing_exit: dict | None = None, execution: dict | None = None):
-        """Package the strategy brain command into JSON and send it back to C++ at warp speed"""
         order_data = {
             "action": action,
             "symbol": symbol,
@@ -58,42 +52,55 @@ class BinanceZmqClient:
             order_data["trailing_exit"] = trailing_exit
         if execution is not None:
             order_data["execution"] = execution
-        self.commander.send_string(json.dumps(order_data))
-        print(f"📤 [Comms] Sent {action} signal to the C++ execution engine")
+
+        if self.use_msgpack:
+            self.commander.send(msgpack.packb(order_data))
+        else:
+            self.commander.send_string(json.dumps(order_data))
+        print(f"[Out] [Comms] Sent {action} signal to the C++ execution engine")
 
     def _send_ack(self):
         """Tell C++ this bar has been processed (required for sync backtest)."""
-        self.commander.send_string(json.dumps({"type": "ack"}))
+        if self.use_msgpack:
+            self.commander.send(msgpack.packb({"type": "ack"}))
+        else:
+            self.commander.send_string(json.dumps({"type": "ack"}))
+
+    def _parse_message(self, raw_bytes: bytes) -> dict:
+        if not raw_bytes:
+            return {}
+        if raw_bytes.startswith(b"{") or raw_bytes.startswith(b"["):
+            return json.loads(raw_bytes.decode("utf-8"))
+        try:
+            return msgpack.unpackb(raw_bytes, raw=False)
+        except Exception:
+            return json.loads(raw_bytes.decode("utf-8"))
 
     def start_listening(self):
         self.is_running = True
         try:
             while self.is_running:
                 try:
-                    message = self.subscriber.recv_string()
+                    raw_msg = self.subscriber.recv()
                 except zmq.Again:
-                    # RCVTIMEO fired with no message — loop back so we keep
-                    # checking is_running and can honor Ctrl+C promptly.
                     continue
-                data = json.loads(message)
+                data = self._parse_message(raw_msg)
                 mtype = data.get("type")
                 if mtype == "kline" and self.kline_callback:
                     self.kline_callback(data)
-                    # ACK after strategy callback so any order is pushed first.
                     self._send_ack()
                 elif mtype == "order_update" and self.order_update_callback:
                     self.order_update_callback(data)
         except KeyboardInterrupt:
-            print("\n🛑 [ZMQ Client] Listening stopped.")
+            print("\n[Stop] [ZMQ Client] Listening stopped.")
         except Exception as e:
             import traceback
-            print("🔥 [ZMQ Client] FATAL in start_listening:")
+            print("[Fatal] [ZMQ Client] FATAL in start_listening:")
             traceback.print_exc()
         finally:
             self.close()
 
     def stop(self):
-        """Request a clean shutdown of the listen loop (interrupts a pending recv)."""
         self.is_running = False
 
     def close(self):

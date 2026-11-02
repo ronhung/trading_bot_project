@@ -5,6 +5,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <vector>
+#include <nlohmann/json.hpp>
 #include <zmq.hpp>
 #include "kline_data.h"
 #include "i_order_executor.h"
@@ -39,10 +41,10 @@ public:
 
 private:
     void receive_loop();
-    void handle_message(const std::string& msg_str);
+    void handle_json(const nlohmann::json& j);
     bool recv_until_ack(int timeout_ms);
 
-    // Thread-safe enqueue of an order status update JSON string.
+    // Thread-safe enqueue of an order status update.
     void queue_order_update(const OrderStatusUpdate& u);
 
     zmq::context_t context;
@@ -57,5 +59,5 @@ private:
     RiskManager* risk_manager_;
 
     // Queue for order status updates to be published from the main-loop thread.
-    ThreadSafeQueue<std::string> order_update_queue_;
+    ThreadSafeQueue<std::vector<uint8_t>> order_update_queue_;
 };
