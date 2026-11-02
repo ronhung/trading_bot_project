@@ -56,10 +56,15 @@ def register_risk(name: str):
     return decorator
 
 
+_BUILTINS_REGISTERED = False
+
+
 def _lazy_register_builtins():
     """Import and register standard builtin components."""
-    if TRIGGER_REGISTRY:
+    global _BUILTINS_REGISTERED
+    if _BUILTINS_REGISTERED:
         return
+    _BUILTINS_REGISTERED = True
 
     # Triggers
     from research.triggers.trend_breakout import TrendFilteredBreakoutTrigger
@@ -78,11 +83,13 @@ def _lazy_register_builtins():
     from research.triggers.absorption_divergence import AbsorptionDivergenceTrigger
     from research.triggers.liquidation_climax import LiquidationClimaxTrigger
     from research.triggers.dynamic_vwap_band import DynamicVWAPBandTrigger
+    from research.triggers.kalman_pairs import KalmanPairsTrigger
 
     register_trigger("ofi_momentum")(OFIMomentumTrigger)
     register_trigger("absorption_divergence")(AbsorptionDivergenceTrigger)
     register_trigger("liquidation_climax")(LiquidationClimaxTrigger)
     register_trigger("dynamic_vwap_band")(DynamicVWAPBandTrigger)
+    register_trigger("kalman_pairs")(KalmanPairsTrigger)
 
     # Sizers
     from execution.sizers import FixedRiskSizer, VolatilityTargetingSizer, HalfKellySizer

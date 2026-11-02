@@ -1,0 +1,50 @@
+# ================================================================
+# Strategy: Kalman Filter Dynamic Pairs Arbitrage (Statistical Arbitrage)
+# ================================================================
+# Target Pair: ETHUSDT (Asset Y) / BTCUSDT (Asset X)
+# Model: Online State-Space Kalman Filter (Dynamic Beta Tracking)
+# Cointegration Residual: e_t = Y_t - (alpha_t + beta_t * X_t)
+# Residual Standardization: Rolling Z-Score (120 bars = 2 hours)
+# Signals:
+#   Entry: |Z_t| >= 2.0 (Spread extreme deviation)
+#   Exit:  |Z_t| <= 0.2 (Mean reversion complete)
+#   Stop:  |Z_t| >= 4.0 (Structural cointegration breakdown)
+# Sizing: Dollar-Neutral Market Allocation (Leverage 2.0x total portfolio)
+# Execution: Post-Only Maker 0.02% Entry / Maker 0.02% Exit / Taker 0.05% Stop
+# ================================================================
+
+strategy:
+  name: "kalman_pairs_arb"
+  version: "1.0"
+  symbol_y: "ETHUSDT"
+  symbol_x: "BTCUSDT"
+
+data:
+  source_y: "data/historical_data/ETHUSDT_1m_microstructure.parquet"
+  source_x: "data/historical_data/BTCUSDT_1m_microstructure_3yr.parquet"
+  train_range: ["2021-01-01", "2023-01-01"]
+  test_range:  ["2023-01-01", "2023-12-31"]
+
+kalman:
+  delta: 1.0e-4        # Transition covariance adaptation rate
+  R: 1.0e-3            # Measurement error variance
+  zscore_window: 120   # 2-hour rolling residual window
+  entry_z: 2.0         # Entry threshold
+  exit_z: 0.2          # Target mean reversion exit threshold
+  stop_z: 4.0          # Cointegration break stop-loss threshold
+  cooldown: 60         # Minimum bars between trades
+
+sizing:
+  type: "fixed_risk"
+  target_leg_notional: 100000.0
+  max_leverage: 3.0
+
+execution:
+  entry:
+    order_type: "limit_post_only"
+    timeout_bars: 2
+  exit:
+    tp_order_type: "limit"
+    sl_order_type: "market"
+  maker_commission: 0.0002
+  taker_commission: 0.0005

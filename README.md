@@ -181,6 +181,7 @@ python scripts/run_system.py --config config/ofi_momentum.yaml --mode live
 | **Absorption & Divergence** | `AbsorptionDivergenceTrigger` | Iceberg absorption detection + Regime filter + Post-Only Maker execution | Churn cut by 50%, Max DD halved to 23.2% OOS | `config/absorption_divergence.yaml` |
 | **Liquidation Climax Fading** | `LiquidationClimaxTrigger` | Trades Count spike + VWAP extreme dislocation + Regime filter | Max DD cut to 12.4% OOS, Trades cut by 76% | `config/liquidation_climax.yaml` |
 | **Dynamic VWAP Band Reversion** | `DynamicVWAPBandTrigger` | Volume-weighted std bands + OFI boundary rejection + Maker execution | Full 3-Yr Return -4.3% (from -65.1%), Max DD 13.0% | `config/dynamic_vwap_band.yaml` |
+| **Kalman Pairs Arbitrage** | `KalmanPairsTrigger` | Online State-Space Kalman Filter dynamic beta tracking + I(0) residual mean-reversion | Proven I(0) stationarity (ADF p < 0.0001), 60%+ win rates | `config/kalman_pairs_arb.yaml` |
 | **Trend Breakout (High-Freq)** | `TrendFilteredBreakoutTrigger` | 1.5-day breakout gated by 6-day trend MA + XGBoost win-probability gate | Sharpe +0.74, Return +81%, Max DD 22% | `config/trend_breakout_highfreq.yaml` |
 | **Trend Breakout (Low-Freq)** | `TrendFilteredBreakoutTrigger` | 5-day breakout gated by 20-day trend MA (pure rule-based) | Low turnover (~1 trade/month), robust trend capture | `config/trend_breakout_lowfreq.yaml` |
 
