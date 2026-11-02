@@ -62,6 +62,10 @@ def lightweight_backtest(
     indicator_params: Optional[Dict] = None,
     initial_capital: float = 10000.0,
     commission: float = 0.0005,
+    entry_order_type: str = "market", # "market" or "limit_post_only"
+    maker_commission: float = 0.0002, # 0.02%
+    taker_commission: float = 0.0005, # 0.05%
+    limit_timeout_bars: int = 2,
     verbose: bool = False,
 ) -> dict:
     """
@@ -87,6 +91,8 @@ def lightweight_backtest(
     sides = sig_vals[event_idx].astype(int)
     n = len(ind)
     close = ind["close"].values
+    high = ind["high"].values if "high" in ind.columns else close
+    low = ind["low"].values if "low" in ind.columns else close
     atr = ind["atr"].values if "atr" in ind.columns else np.full(n, np.nan)
 
     # --- 3. Exits ---
@@ -148,6 +154,23 @@ def lightweight_backtest(
 
             allowed = True
 
+            # Maker post-only fill check
+            is_limit = (entry_order_type.lower() in ("limit", "limit_post_only", "maker"))
+            if is_limit:
+                filled = False
+                max_check = min(ei + 1 + limit_timeout_bars, n)
+                for look_idx in range(ei + 1, max_check):
+                    if side == 1:
+                        if low[look_idx] <= eprice:
+                            filled = True
+                            break
+                    else:
+                        if high[look_idx] >= eprice:
+                            filled = True
+                            break
+                if not filled:
+                    allowed = False
+
             # risk gate: rolling-peak drawdown
             if allowed and risk_manager is not None:
                 rolling_peak = equity[window[0]] if window else capital
@@ -183,13 +206,20 @@ def lightweight_backtest(
 
             if allowed:
                 raw_pnl = side * (xprice - eprice) * size
-                fees = commission * (eprice + xprice) * size
+                exit_reason = barrier_hit_arr[k]
+                if is_limit:
+                    entry_fee = maker_commission * eprice * size
+                    exit_comm = maker_commission if exit_reason == "upper" else taker_commission
+                    exit_fee = exit_comm * xprice * size
+                    fees = entry_fee + exit_fee
+                else:
+                    fees = commission * (eprice + xprice) * size
                 pnl = raw_pnl - fees
                 open_trade = {
                     "entry_idx": ei, "exit_idx": xidx, "side": side,
                     "entry_price": eprice, "exit_price": xprice, "size": size, "pnl": pnl,
                     "entry_time": ind.index[ei], "exit_time": ind.index[xidx],
-                    "bars_held": xidx - ei, "exit_reason": barrier_hit_arr[k],
+                    "bars_held": xidx - ei, "exit_reason": exit_reason,
                     "pnl_pct": pnl / initial_capital * 100.0,
                 }
 

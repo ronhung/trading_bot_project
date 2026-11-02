@@ -2,15 +2,17 @@
 # Strategy 4: Dynamic VWAP Band Reversion
 # ================================================================
 # Trigger: DynamicVWAPBandTrigger (Rolling VWAP Bands + OFI Rejection Confirmation)
+# Regime Filter: Active only when ATR <= 35th percentile of 24h
 # Microstructure Data: 3-Year Binance USD-M Futures aggTrades (2021-2023)
-# Barrier: TripleBarrierLabeler / TrailingExitLabeler
-# Sizing: Half-Kelly / Fixed Risk
+# Barrier: TripleBarrierLabeler (1.6% TP / 1.0% SL / 90 bars max hold)
+# Sizing: FixedRiskSizer (1.2% risk, max_leverage 6.0)
+# Execution: Hybrid Maker Entry (Post-Only 0.02%) + Limit TP / Market SL
 # Risk Manager: MaxDrawdownRiskManager (max_dd 20%)
 # ================================================================
 
 strategy:
   name: "dynamic_vwap_band"
-  version: "1.0"
+  version: "1.1"
   symbol: "BTCUSDT"
 
 data:
@@ -21,20 +23,23 @@ data:
 trigger:
   type: "research.triggers.dynamic_vwap_band.DynamicVWAPBandTrigger"
   params:
-    vwap_window: 720
-    band_mult: 2.5
-    ofi_window: 30
-    ofi_threshold: 0.03
-    cooldown: 180
+    vwap_window: 240
+    band_mult: 2.3
+    ofi_window: 15
+    ofi_threshold: 0.025
+    cooldown: 120
+    regime_filter: true
+    regime_window: 1440
+    regime_quantile: 0.35
     allow_long: true
-    allow_short: false
+    allow_short: true
 
 indicators:
-  entry_period: 720
-  exit_period: 360
-  atr_period: 720
-  vol_period: 1440
-  ma_period: 2880
+  entry_period: 240
+  exit_period: 90
+  atr_period: 120
+  vol_period: 240
+  ma_period: 1440
 
 features:
   - type: "research.features.ATRFeature"
@@ -43,16 +48,16 @@ features:
   - type: "research.features.TrendFilterFeature"
 
 labeler:
-  type: "research.labeling.TrailingExitLabeler"
+  type: "research.labeling.TripleBarrierLabeler"
   params:
-    trail_period: 360
+    upper_barrier: 0.016
+    lower_barrier: -0.010
+    horizon: 90
 
 sizing:
-  type: "half_kelly"
-  win_rate: 0.45
-  profit_factor: 2.0
-  max_risk_cap: 0.035
-  max_leverage: 8.0
+  type: "fixed_risk"
+  risk_pct: 0.012
+  max_leverage: 6.0
 
 risk:
   type: "max_drawdown"
@@ -60,12 +65,10 @@ risk:
 
 execution:
   entry:
-    order_type: market
-    time_in_force: gtc
-    timeout_ms: 0
-    unfilled_policy: cancel
+    order_type: "limit_post_only"
+    timeout_bars: 2
   exit:
-    order_type: market
-    time_in_force: gtc
-    timeout_ms: 3000
-    unfilled_policy: market
+    tp_order_type: "limit"
+    sl_order_type: "market"
+  maker_commission: 0.0002
+  taker_commission: 0.0005

@@ -47,6 +47,9 @@ class AbsorptionDivergenceTrigger(BaseEventTrigger):
         cooldown: int = 60,
         allow_long: bool = True,
         allow_short: bool = True,
+        regime_filter: bool = True,
+        regime_window: int = 1440,
+        regime_quantile: float = 0.35,
         **kwargs,
     ):
         self.vol_window = int(vol_window)
@@ -58,6 +61,9 @@ class AbsorptionDivergenceTrigger(BaseEventTrigger):
         self.cooldown = int(cooldown)
         self.allow_long = bool(allow_long)
         self.allow_short = bool(allow_short)
+        self.regime_filter = bool(regime_filter)
+        self.regime_window = int(regime_window)
+        self.regime_quantile = float(regime_quantile)
 
     def generate_signals(self, data: pd.DataFrame) -> pd.Series:
         close = data["close"]
@@ -106,6 +112,13 @@ class AbsorptionDivergenceTrigger(BaseEventTrigger):
             & (taker_ratio > self.taker_high)
             & (is_absorbed | (upper_shadow >= 0.40))
         )
+
+        # Regime filter: only active in compressed ranging conditions (ATR <= quantile)
+        if self.regime_filter:
+            atr_q = atr.rolling(self.regime_window).quantile(self.regime_quantile)
+            regime_ok = (atr <= atr_q)
+            long_cond = long_cond & regime_ok
+            short_cond = short_cond & regime_ok
 
         signals = pd.Series(0, index=data.index, dtype=int)
         signals[long_cond] = 1

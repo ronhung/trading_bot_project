@@ -74,26 +74,40 @@ def run_from_config(config_path: str):
     train_range = cfg.get("data", {}).get("train_range", None)
     test_range = cfg.get("data", {}).get("test_range", None)
 
+    exec_cfg = cfg.get("execution", {})
+    entry_cfg = exec_cfg.get("entry", {})
+    entry_order_type = entry_cfg.get("order_type", "market")
+    maker_comm = float(exec_cfg.get("maker_commission", 0.0002))
+    taker_comm = float(exec_cfg.get("taker_commission", 0.0005))
+    limit_timeout = int(entry_cfg.get("timeout_bars", 2))
+
     name = cfg.get("strategy", {}).get("name", "Strategy")
     print(f"\n=======================================================")
     print(f"Phase 3b Backtest: {name} (Config-Driven Vectorized)")
     print(f"=======================================================")
 
+    exec_kwargs = {
+        "entry_order_type": entry_order_type,
+        "maker_commission": maker_comm,
+        "taker_commission": taker_comm,
+        "limit_timeout_bars": limit_timeout,
+    }
+
     if train_range and len(train_range) == 2:
         train_df = df[(df["datetime"] >= train_range[0]) & (df["datetime"] < train_range[1])].reset_index(drop=True)
         print(f"\n--- TRAIN SET ({train_range[0]} to {train_range[1]}) : {len(train_df):,} bars ---")
-        bt(train_df, f"{name} [TRAIN]", trigger, labeler, ind_params, sizer=sizer, risk_mgr=risk_mgr)
+        bt(train_df, f"{name} [TRAIN]", trigger, labeler, ind_params, sizer=sizer, risk_mgr=risk_mgr, **exec_kwargs)
 
     if test_range and len(test_range) == 2:
         test_df = df[(df["datetime"] >= test_range[0]) & (df["datetime"] <= test_range[1])].reset_index(drop=True)
         print(f"\n--- TEST SET ({test_range[0]} to {test_range[1]}) : {len(test_df):,} bars ---")
-        bt(test_df, f"{name} [TEST]", trigger, labeler, ind_params, sizer=sizer, risk_mgr=risk_mgr)
+        bt(test_df, f"{name} [TEST]", trigger, labeler, ind_params, sizer=sizer, risk_mgr=risk_mgr, **exec_kwargs)
 
     print(f"\n--- FULL 3-YEAR DATASET ({df['datetime'].iloc[0]} to {df['datetime'].iloc[-1]}) : {len(df):,} bars ---")
-    bt(df, f"{name} [FULL 3-YEAR]", trigger, labeler, ind_params, sizer=sizer, risk_mgr=risk_mgr)
+    bt(df, f"{name} [FULL 3-YEAR]", trigger, labeler, ind_params, sizer=sizer, risk_mgr=risk_mgr, **exec_kwargs)
 
 
-def bt(df, name, trigger, labeler, indicator_params, sizer=None, risk_mgr=None, risk_pct=0.01):
+def bt(df, name, trigger, labeler, indicator_params, sizer=None, risk_mgr=None, risk_pct=0.01, **kwargs):
     result = lightweight_backtest(
         df,
         trigger=trigger,
@@ -102,6 +116,7 @@ def bt(df, name, trigger, labeler, indicator_params, sizer=None, risk_mgr=None, 
         risk_manager=risk_mgr or MaxDrawdownRiskManager(max_dd_pct=0.30),
         indicator_params=indicator_params,
         initial_capital=100000.0,
+        **kwargs,
     )
     print(f"[{name}] sharpe={result['sharpe']:+.2f} ret={result['total_return_pct']:+.1f}% "
           f"dd={result['max_dd_pct']:.1f}% trades={result['n_trades']} win={result['win_rate']*100:.0f}%")

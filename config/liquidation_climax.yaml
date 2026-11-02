@@ -2,15 +2,17 @@
 # Strategy 3: Liquidation Climax Fading (Mean Reversion)
 # ================================================================
 # Trigger: LiquidationClimaxTrigger (Trades Count Spike + VWAP Dev + Flow Reversal)
+# Regime Filter: Active only when ATR <= 40th percentile of 24h
 # Microstructure Data: 3-Year Binance USD-M Futures aggTrades (2021-2023)
-# Barrier: TripleBarrierLabeler (2.0% TP / 1.0% SL / 180 bars max hold)
-# Sizing: Half-Kelly (win_rate=0.50, profit_factor=2.0, max_risk_cap=3.5%)
+# Barrier: TripleBarrierLabeler (2.0% TP / 1.0% SL / 120 bars max hold)
+# Sizing: FixedRiskSizer (1.2% risk, max_leverage 6.0)
+# Execution: Hybrid Maker Entry (Post-Only 0.02%) + Limit TP / Market SL
 # Risk Manager: MaxDrawdownRiskManager (max_dd 20%)
 # ================================================================
 
 strategy:
   name: "liquidation_climax"
-  version: "1.0"
+  version: "1.1"
   symbol: "BTCUSDT"
 
 data:
@@ -22,11 +24,14 @@ trigger:
   type: "research.triggers.liquidation_climax.LiquidationClimaxTrigger"
   params:
     trades_window: 120
-    trades_std_mult: 3.0
+    trades_std_mult: 3.2
     deviation_mult: 2.5
     atr_period: 60
     ofi_window: 5
-    cooldown: 90
+    cooldown: 120
+    regime_filter: true
+    regime_window: 1440
+    regime_quantile: 0.40
     allow_long: true
     allow_short: true
 
@@ -48,14 +53,12 @@ labeler:
   params:
     upper_barrier: 0.020
     lower_barrier: -0.010
-    horizon: 180
+    horizon: 120
 
 sizing:
-  type: "half_kelly"
-  win_rate: 0.50
-  profit_factor: 2.0
-  max_risk_cap: 0.035
-  max_leverage: 8.0
+  type: "fixed_risk"
+  risk_pct: 0.012
+  max_leverage: 6.0
 
 risk:
   type: "max_drawdown"
@@ -63,12 +66,10 @@ risk:
 
 execution:
   entry:
-    order_type: market
-    time_in_force: gtc
-    timeout_ms: 0
-    unfilled_policy: cancel
+    order_type: "limit_post_only"
+    timeout_bars: 2
   exit:
-    order_type: market
-    time_in_force: gtc
-    timeout_ms: 3000
-    unfilled_policy: market
+    tp_order_type: "limit"
+    sl_order_type: "market"
+  maker_commission: 0.0002
+  taker_commission: 0.0005

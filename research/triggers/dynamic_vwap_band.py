@@ -42,6 +42,9 @@ class DynamicVWAPBandTrigger(BaseEventTrigger):
         cooldown: int = 60,
         allow_long: bool = True,
         allow_short: bool = True,
+        regime_filter: bool = True,
+        regime_window: int = 1440,
+        regime_quantile: float = 0.40,
         **kwargs,
     ):
         self.vwap_window = int(vwap_window)
@@ -51,6 +54,9 @@ class DynamicVWAPBandTrigger(BaseEventTrigger):
         self.cooldown = int(cooldown)
         self.allow_long = bool(allow_long)
         self.allow_short = bool(allow_short)
+        self.regime_filter = bool(regime_filter)
+        self.regime_window = int(regime_window)
+        self.regime_quantile = float(regime_quantile)
 
     def generate_signals(self, data: pd.DataFrame) -> pd.Series:
         close = data["close"]
@@ -93,6 +99,17 @@ class DynamicVWAPBandTrigger(BaseEventTrigger):
             & (close >= upper_band)
             & (rolling_ofi < -self.ofi_threshold)
         )
+
+        # Regime filter: only active in compressed ranging conditions (ATR <= quantile)
+        if self.regime_filter:
+            high = data["high"] if "high" in data.columns else close
+            low = data["low"] if "low" in data.columns else close
+            tr = np.maximum(high - low, np.maximum((high - close.shift(1)).abs(), (low - close.shift(1)).abs()))
+            atr = tr.rolling(60).mean().bfill()
+            atr_q = atr.rolling(self.regime_window).quantile(self.regime_quantile)
+            regime_ok = (atr <= atr_q)
+            long_cond = long_cond & regime_ok
+            short_cond = short_cond & regime_ok
 
         signals = pd.Series(0, index=data.index, dtype=int)
         signals[long_cond] = 1

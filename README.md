@@ -151,10 +151,12 @@ python scripts/phase3b_backtest.py --config config/ofi_momentum.yaml
 ```
 
 ### Phase 4 — Position Sizing & Margin Risk Limits
-Configured in YAML (`sizing:` and `risk:` blocks) and enforced natively by `execution/sizers.py` and C++ `RiskManager`.
-- **Fixed Risk Sizer (`type: "fixed_risk"`)**: Risks a constant percentage of equity per trade (e.g. 1.5% or 2.0%) relative to the stop distance.
+Configured in YAML (`sizing:`, `risk:`, and `execution:` blocks) and enforced natively by `execution/sizers.py` and C++ `RiskManager`.
+- **Fixed Risk Sizer (`type: "fixed_risk"`)**: Risks a constant percentage of equity per trade (e.g. 1.2% or 1.5%) relative to the stop distance.
 - **Half-Kelly Sizer (`type: "half_kelly"`)**: Dynamically scales position risk using the Half-Kelly criterion ($f_{\text{half}} = 0.5 \cdot \frac{p \cdot b - q}{b}$), with automatic negative-edge trade rejection ($f^* \le 0 \implies \text{size} = 0$) and a protective hard cap (`max_risk_cap`, e.g., 3.5%).
 - **Volatility Target Sizer (`type: "vol_target"`)**: Adjusts leverage inversely to rolling market ATR.
+- **Hybrid Maker/Taker Execution**: Supports `entry.order_type: "limit_post_only"` (0.02% Maker fee with fill penetration verification) and asymmetric exit fees (0.02% Limit TP / 0.05% Market SL).
+- **Regime Switch Filter**: Triggers support `regime_filter: true` gating entry to low-volatility ranging regimes ($ATR \le \text{quantile}$) to prevent counter-trend trades from walking into trending buzzsaws.
 
 ### Phase 5 — High-Fidelity C++ Engine Backtest
 Runs full historical replay with queue-based order book penetration, non-linear market impact, and taker fees:
@@ -176,6 +178,9 @@ python scripts/run_system.py --config config/ofi_momentum.yaml --mode live
 | :--- | :--- | :--- | :--- | :--- |
 | **OFI Momentum (Fixed Risk)** | `OFIMomentumTrigger` | Order Flow Imbalance surge + Donchian breakout + macro trend (1.5% fixed risk) | **OOS Sharpe +1.92**, Return +30.1%, Max DD 8.2% (Full 3-Yr: +24.3%, DD 12.6%) | `config/ofi_momentum.yaml` |
 | **OFI Momentum (Half-Kelly)** | `OFIMomentumTrigger` | Order Flow Imbalance + Donchian breakout with Half-Kelly sizing (3.5% cap) | **OOS Sharpe +1.98**, Return +76.7%, Max DD 17.7% (Full 3-Yr: +56.0%, DD 26.6%) | `config/ofi_momentum_half_kelly.yaml` |
+| **Absorption & Divergence** | `AbsorptionDivergenceTrigger` | Iceberg absorption detection + Regime filter + Post-Only Maker execution | Churn cut by 50%, Max DD halved to 23.2% OOS | `config/absorption_divergence.yaml` |
+| **Liquidation Climax Fading** | `LiquidationClimaxTrigger` | Trades Count spike + VWAP extreme dislocation + Regime filter | Max DD cut to 12.4% OOS, Trades cut by 76% | `config/liquidation_climax.yaml` |
+| **Dynamic VWAP Band Reversion** | `DynamicVWAPBandTrigger` | Volume-weighted std bands + OFI boundary rejection + Maker execution | Full 3-Yr Return -4.3% (from -65.1%), Max DD 13.0% | `config/dynamic_vwap_band.yaml` |
 | **Trend Breakout (High-Freq)** | `TrendFilteredBreakoutTrigger` | 1.5-day breakout gated by 6-day trend MA + XGBoost win-probability gate | Sharpe +0.74, Return +81%, Max DD 22% | `config/trend_breakout_highfreq.yaml` |
 | **Trend Breakout (Low-Freq)** | `TrendFilteredBreakoutTrigger` | 5-day breakout gated by 20-day trend MA (pure rule-based) | Low turnover (~1 trade/month), robust trend capture | `config/trend_breakout_lowfreq.yaml` |
 

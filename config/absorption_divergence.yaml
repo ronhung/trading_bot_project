@@ -2,15 +2,17 @@
 # Strategy 2: Liquidity Absorption & Divergence (Iceberg Detection)
 # ================================================================
 # Trigger: AbsorptionDivergenceTrigger (Volume Surge + Taker Flow + Stagnation)
+# Regime Filter: Active only during range regime (ATR <= 35th percentile of 24h)
 # Microstructure Data: 3-Year Binance USD-M Futures aggTrades (2021-2023)
 # Barrier: TripleBarrierLabeler (1.8% TP / 0.9% SL / 120 bars max hold)
-# Sizing: Half-Kelly (win_rate=0.52, profit_factor=2.0, max_risk_cap=3.5%)
+# Sizing: FixedRiskSizer (1.2% risk, max_leverage 6.0)
+# Execution: Hybrid Maker Entry (Post-Only 0.02%) + Limit TP / Market SL
 # Risk Manager: MaxDrawdownRiskManager (max_dd 20%)
 # ================================================================
 
 strategy:
   name: "absorption_divergence"
-  version: "1.0"
+  version: "1.1"
   symbol: "BTCUSDT"
 
 data:
@@ -22,12 +24,15 @@ trigger:
   type: "research.triggers.absorption_divergence.AbsorptionDivergenceTrigger"
   params:
     vol_window: 60
-    vol_mult: 2.8
-    taker_high: 0.72
-    taker_low: 0.28
+    vol_mult: 3.2
+    taker_high: 0.75
+    taker_low: 0.25
     absorption_ratio: 0.15
     atr_period: 60
-    cooldown: 90
+    cooldown: 120
+    regime_filter: true
+    regime_window: 1440
+    regime_quantile: 0.35
     allow_long: true
     allow_short: true
 
@@ -52,11 +57,9 @@ labeler:
     horizon: 120
 
 sizing:
-  type: "half_kelly"
-  win_rate: 0.52
-  profit_factor: 2.0
-  max_risk_cap: 0.035
-  max_leverage: 8.0
+  type: "fixed_risk"
+  risk_pct: 0.012
+  max_leverage: 6.0
 
 risk:
   type: "max_drawdown"
@@ -64,12 +67,10 @@ risk:
 
 execution:
   entry:
-    order_type: market
-    time_in_force: gtc
-    timeout_ms: 0
-    unfilled_policy: cancel
+    order_type: "limit_post_only"
+    timeout_bars: 2
   exit:
-    order_type: market
-    time_in_force: gtc
-    timeout_ms: 3000
-    unfilled_policy: market
+    tp_order_type: "limit"
+    sl_order_type: "market"
+  maker_commission: 0.0002
+  taker_commission: 0.0005
