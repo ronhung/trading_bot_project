@@ -102,7 +102,11 @@ class StrategyWrapper:
         self._exit_execution = exit_execution or DEFAULT_EXIT_EXECUTION
         # O(1) streaming indicators — replaces recomputing add_indicators over
         # the whole lookback buffer on every bar (was O(n^2) total).
-        self._incremental = IncrementalIndicators(**self._indicator_params)
+        inc_kwargs = {
+            k: v for k, v in self._indicator_params.items()
+            if k in ("entry_period", "exit_period", "atr_period", "vol_period", "ma_period")
+        }
+        self._incremental = IncrementalIndicators(**inc_kwargs)
 
     # -- public API -------------------------------------------------------
 
@@ -304,7 +308,11 @@ class StrategyWrapper:
         """Reset state and clear indicator history (e.g., for backtest restart)."""
         self._state = StrategyState.IDLE
         self._saw_position = False
-        self._incremental = IncrementalIndicators(**self._indicator_params)
+        inc_kwargs = {
+            k: v for k, v in self._indicator_params.items()
+            if k in ("entry_period", "exit_period", "atr_period", "vol_period", "ma_period")
+        }
+        self._incremental = IncrementalIndicators(**inc_kwargs)
 
     def warmup(self, bars: List[Dict[str, Any]]) -> None:
         """Feed historical bars into the incremental indicators (live cold-start).

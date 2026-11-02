@@ -18,4 +18,6 @@ CMakeCache.txt
 CMakeFiles/
 *.exe
 *.dll
-*.libdata/historical_data/aggtrades/
+*.lib
+data/historical_data/aggtrades/
+

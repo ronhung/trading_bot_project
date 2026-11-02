@@ -42,6 +42,7 @@ from research.triggers.adam_breakout import AdamBreakoutTrigger
 from research.triggers.trend_breakout import TrendFilteredBreakoutTrigger
 from live_strategy.zmq_feeder import BinanceZmqDataFeeder
 from live_strategy.zmq_gateway import BinanceZmqExecutionGateway
+from core.strategy_factory import build_strategy_from_config
 
 
 class LiveTurtleBot:
@@ -158,6 +159,25 @@ class LiveTurtleBot:
         # Wire order status updates so an abandoned (never-filled) entry resets
         # the brain from WAITING_CLOSE back to IDLE.
         self.feeder.set_order_update_callback(self.strategy.on_order_update)
+
+    @classmethod
+    def from_config(cls, config_path: str, warmup: bool = True):
+        wrapper, meta = build_strategy_from_config(config_path)
+        bot = cls.__new__(cls)
+        bot.symbol = meta["symbol"]
+        bot.warmup = warmup
+        bot.feeder = BinanceZmqDataFeeder(
+            symbol=meta["symbol"],
+            entry_period=meta["indicator_params"]["entry_period"],
+            atr_period=meta["indicator_params"]["atr_period"],
+            warmup=warmup,
+            warmup_period=meta["warmup_period"],
+        )
+        bot.gateway = BinanceZmqExecutionGateway(bot.feeder.client)
+        bot.strategy = wrapper
+        bot.gateway.set_position_closed_callback(bot.strategy.on_position_closed)
+        bot.feeder.set_order_update_callback(bot.strategy.on_order_update)
+        return bot
 
     def start(self) -> None:
         """Connect and begin the event loop."""
@@ -324,12 +344,7 @@ if __name__ == "__main__":
         print(f"  Entry exec: {entry_execution.to_dict()}")
         print(f"  Exit  exec: {exit_execution.to_dict()}")
         print("=" * 50)
-        bot = LiveTurtleBot(
-            warmup=not args.no_warmup,
-            entry_execution=entry_execution,
-            exit_execution=exit_execution,
-            **kw,
-        )
+        bot = LiveTurtleBot.from_config(args.config, warmup=not args.no_warmup)
     else:
         entry_execution = ExecutionSpec.from_dict({
             "order_type": args.exec_entry_order,
