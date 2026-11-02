@@ -501,10 +501,10 @@ class TripleBarrierLabeler(BaseLabeler):
         self.barrier_mode = barrier_mode
 
     def compute_labels(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_mask = events != 0 if np.issubdtype(events.dtype, np.integer) else events.astype(bool)
         event_indices = np.flatnonzero(event_mask.values)
 
-        if events.dtype == int and set(events.unique()) - {0} <= {-1, 1}:
+        if np.issubdtype(events.dtype, np.integer) and set(events.unique()) - {0} <= {-1, 1}:
             sides = events[event_mask].values.astype(int)
         else:
             sides = np.ones(len(event_indices), dtype=int)
@@ -543,10 +543,10 @@ class FixedHorizonLabeler(BaseLabeler):
         self.horizon = horizon
 
     def compute_labels(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_mask = events != 0 if np.issubdtype(events.dtype, np.integer) else events.astype(bool)
         event_indices = np.flatnonzero(event_mask.values)
 
-        if events.dtype == int and set(events.unique()) - {0} <= {-1, 1}:
+        if np.issubdtype(events.dtype, np.integer) and set(events.unique()) - {0} <= {-1, 1}:
             sides = events[event_mask].values.astype(int)
         else:
             sides = np.ones(len(event_indices), dtype=int)
@@ -582,7 +582,7 @@ class TurtleExitLabeler(BaseLabeler):
         self.atr_mult = atr_mult
 
     def compute_labels(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_mask = events != 0 if np.issubdtype(events.dtype, np.integer) else events.astype(bool)
         event_indices = np.flatnonzero(np.asarray(event_mask.values))
 
         cols = ["label", "barrier_hit", "exit_idx", "n_bars_held",
@@ -590,7 +590,7 @@ class TurtleExitLabeler(BaseLabeler):
         if len(event_indices) == 0:
             return pd.DataFrame(columns=cols)
 
-        if events.dtype == int and set(events.unique()) - {0} <= {-1, 1}:
+        if np.issubdtype(events.dtype, np.integer) and set(events.unique()) - {0} <= {-1, 1}:
             sides = np.asarray(events.values)[event_indices].astype(int)
         else:
             sides = np.ones(len(event_indices), dtype=int)
@@ -688,14 +688,14 @@ class TrailingExitLabeler(BaseLabeler):
         self.trail_period = trail_period
 
     def compute_labels(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_mask = events != 0 if np.issubdtype(events.dtype, np.integer) else events.astype(bool)
         event_indices = np.flatnonzero(np.asarray(event_mask.values))
         cols = ["label", "barrier_hit", "exit_idx", "n_bars_held",
                 "entry_price", "exit_price", "stop_distance", "actual_return", "r_multiple"]
         if len(event_indices) == 0:
             return pd.DataFrame(columns=cols)
 
-        if events.dtype == int and set(events.unique()) - {0} <= {-1, 1}:
+        if np.issubdtype(events.dtype, np.integer) and set(events.unique()) - {0} <= {-1, 1}:
             sides = np.asarray(events.values)[event_indices].astype(int)
         else:
             sides = np.ones(len(event_indices), dtype=int)
@@ -793,7 +793,7 @@ class MeanReversionLabeler(BaseLabeler):
         self.max_hold = max_hold
 
     def compute_labels(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_mask = events != 0 if np.issubdtype(events.dtype, np.integer) else events.astype(bool)
         event_indices = np.flatnonzero(event_mask.values)
         cols = ["label", "barrier_hit", "exit_idx", "n_bars_held",
                 "entry_price", "exit_price", "stop_distance", "actual_return", "r_multiple"]

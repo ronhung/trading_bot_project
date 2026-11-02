@@ -287,7 +287,7 @@ class _CallableFeature(BaseFeature):
         self._name = name
 
     def compute(self, data: pd.DataFrame, events: pd.Series) -> pd.DataFrame:
-        event_mask = events != 0 if events.dtype == int else events.astype(bool)
+        event_mask = events != 0 if np.issubdtype(events.dtype, np.integer) else events.astype(bool)
         event_indices = np.flatnonzero(event_mask.values)
         rows = [self._func(data, int(idx)) for idx in event_indices]
         if not rows:
