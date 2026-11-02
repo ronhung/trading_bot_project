@@ -513,7 +513,7 @@ class TripleBarrierLabeler(BaseLabeler):
         if self.barrier_mode == "atr":
             atr_vals = data["atr"].values if "atr" in data.columns else None
 
-        return apply_triple_barrier(
+        out = apply_triple_barrier(
             close=data["close"].values,
             high=data["high"].values,
             low=data["low"].values,
@@ -525,6 +525,12 @@ class TripleBarrierLabeler(BaseLabeler):
             barrier_mode=self.barrier_mode,
             atr_values=atr_vals,
         )
+        if len(out) > 0:
+            if self.barrier_mode == "atr" and atr_vals is not None:
+                out["stop_distance"] = float(abs(self.lower_barrier)) * atr_vals[event_indices]
+            else:
+                out["stop_distance"] = out["entry_price"] * float(abs(self.lower_barrier))
+        return out
 
 
 class FixedHorizonLabeler(BaseLabeler):

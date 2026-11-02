@@ -1,0 +1,71 @@
+# ================================================================
+# Strategy 4: Dynamic VWAP Band Reversion
+# ================================================================
+# Trigger: DynamicVWAPBandTrigger (Rolling VWAP Bands + OFI Rejection Confirmation)
+# Microstructure Data: 3-Year Binance USD-M Futures aggTrades (2021-2023)
+# Barrier: TripleBarrierLabeler / TrailingExitLabeler
+# Sizing: Half-Kelly / Fixed Risk
+# Risk Manager: MaxDrawdownRiskManager (max_dd 20%)
+# ================================================================
+
+strategy:
+  name: "dynamic_vwap_band"
+  version: "1.0"
+  symbol: "BTCUSDT"
+
+data:
+  source: "data/historical_data/BTCUSDT_1m_microstructure_3yr.parquet"
+  train_range: ["2021-01-01", "2023-01-01"]
+  test_range:  ["2023-01-01", "2023-12-31"]
+
+trigger:
+  type: "research.triggers.dynamic_vwap_band.DynamicVWAPBandTrigger"
+  params:
+    vwap_window: 720
+    band_mult: 2.5
+    ofi_window: 30
+    ofi_threshold: 0.03
+    cooldown: 180
+    allow_long: true
+    allow_short: false
+
+indicators:
+  entry_period: 720
+  exit_period: 360
+  atr_period: 720
+  vol_period: 1440
+  ma_period: 2880
+
+features:
+  - type: "research.features.ATRFeature"
+  - type: "research.features.VolumeRatioFeature"
+  - type: "research.features.TakerFlowFeature"
+  - type: "research.features.TrendFilterFeature"
+
+labeler:
+  type: "research.labeling.TrailingExitLabeler"
+  params:
+    trail_period: 360
+
+sizing:
+  type: "half_kelly"
+  win_rate: 0.45
+  profit_factor: 2.0
+  max_risk_cap: 0.035
+  max_leverage: 8.0
+
+risk:
+  type: "max_drawdown"
+  max_dd_pct: 0.20
+
+execution:
+  entry:
+    order_type: market
+    time_in_force: gtc
+    timeout_ms: 0
+    unfilled_policy: cancel
+  exit:
+    order_type: market
+    time_in_force: gtc
+    timeout_ms: 3000
+    unfilled_policy: market

@@ -74,6 +74,16 @@ def _lazy_register_builtins():
     register_trigger("turtle")(TurtleBreakoutTrigger)
     register_trigger("bollinger_mean_reversion")(BollingerMeanReversionTrigger)
 
+    from research.triggers.ofi_momentum import OFIMomentumTrigger
+    from research.triggers.absorption_divergence import AbsorptionDivergenceTrigger
+    from research.triggers.liquidation_climax import LiquidationClimaxTrigger
+    from research.triggers.dynamic_vwap_band import DynamicVWAPBandTrigger
+
+    register_trigger("ofi_momentum")(OFIMomentumTrigger)
+    register_trigger("absorption_divergence")(AbsorptionDivergenceTrigger)
+    register_trigger("liquidation_climax")(LiquidationClimaxTrigger)
+    register_trigger("dynamic_vwap_band")(DynamicVWAPBandTrigger)
+
     # Sizers
     from execution.sizers import FixedRiskSizer, VolatilityTargetingSizer, HalfKellySizer
     register_sizer("fixed_risk")(FixedRiskSizer)

@@ -69,3 +69,13 @@ def test_half_kelly_sizer():
     assert wrapper._sizer.win_rate == 0.48
     assert wrapper._sizer.max_risk_cap == 0.035
 
+
+def test_microstructure_triggers_registered():
+    from core.strategy_factory import _lazy_register_builtins, TRIGGER_REGISTRY
+    _lazy_register_builtins()
+    assert "ofi_momentum" in TRIGGER_REGISTRY
+    assert "absorption_divergence" in TRIGGER_REGISTRY
+    assert "liquidation_climax" in TRIGGER_REGISTRY
+    assert "dynamic_vwap_band" in TRIGGER_REGISTRY
+
+

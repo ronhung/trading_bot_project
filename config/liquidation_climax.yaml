@@ -1,0 +1,74 @@
+# ================================================================
+# Strategy 3: Liquidation Climax Fading (Mean Reversion)
+# ================================================================
+# Trigger: LiquidationClimaxTrigger (Trades Count Spike + VWAP Dev + Flow Reversal)
+# Microstructure Data: 3-Year Binance USD-M Futures aggTrades (2021-2023)
+# Barrier: TripleBarrierLabeler (2.0% TP / 1.0% SL / 180 bars max hold)
+# Sizing: Half-Kelly (win_rate=0.50, profit_factor=2.0, max_risk_cap=3.5%)
+# Risk Manager: MaxDrawdownRiskManager (max_dd 20%)
+# ================================================================
+
+strategy:
+  name: "liquidation_climax"
+  version: "1.0"
+  symbol: "BTCUSDT"
+
+data:
+  source: "data/historical_data/BTCUSDT_1m_microstructure_3yr.parquet"
+  train_range: ["2021-01-01", "2023-01-01"]
+  test_range:  ["2023-01-01", "2023-12-31"]
+
+trigger:
+  type: "research.triggers.liquidation_climax.LiquidationClimaxTrigger"
+  params:
+    trades_window: 120
+    trades_std_mult: 3.0
+    deviation_mult: 2.5
+    atr_period: 60
+    ofi_window: 5
+    cooldown: 90
+    allow_long: true
+    allow_short: true
+
+indicators:
+  entry_period: 120
+  exit_period: 60
+  atr_period: 60
+  vol_period: 60
+  ma_period: 1440
+
+features:
+  - type: "research.features.ATRFeature"
+  - type: "research.features.VolumeRatioFeature"
+  - type: "research.features.TakerFlowFeature"
+  - type: "research.features.LaggedReturnsFeature"
+
+labeler:
+  type: "research.labeling.TripleBarrierLabeler"
+  params:
+    upper_barrier: 0.020
+    lower_barrier: -0.010
+    horizon: 180
+
+sizing:
+  type: "half_kelly"
+  win_rate: 0.50
+  profit_factor: 2.0
+  max_risk_cap: 0.035
+  max_leverage: 8.0
+
+risk:
+  type: "max_drawdown"
+  max_dd_pct: 0.20
+
+execution:
+  entry:
+    order_type: market
+    time_in_force: gtc
+    timeout_ms: 0
+    unfilled_policy: cancel
+  exit:
+    order_type: market
+    time_in_force: gtc
+    timeout_ms: 3000
+    unfilled_policy: market
