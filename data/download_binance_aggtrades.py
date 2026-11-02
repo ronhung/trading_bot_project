@@ -77,18 +77,31 @@ def process_month(year: int, month: int, symbol: str = SYMBOL) -> str | None:
         with zipfile.ZipFile(io.BytesIO(content)) as z:
             csv_name = [name for name in z.namelist() if name.endswith(".csv")][0]
             with z.open(csv_name) as f:
-                chunk_iter = pd.read_csv(
-                    f,
-                    header=0,
-                    usecols=["price", "quantity", "transact_time", "is_buyer_maker"],
-                    dtype={
+                sample = f.readline().decode("utf-8", errors="ignore").lower()
+                has_header = "price" in sample or "transact_time" in sample
+                f.seek(0)
+
+                read_kwargs = {
+                    "usecols": ["price", "quantity", "transact_time", "is_buyer_maker"],
+                    "dtype": {
                         "price": "float32",
                         "quantity": "float32",
                         "transact_time": "uint64",
                         "is_buyer_maker": "bool",
                     },
-                    chunksize=1_000_000,
-                )
+                    "chunksize": 1_000_000,
+                }
+                if has_header:
+                    read_kwargs["header"] = 0
+                else:
+                    read_kwargs["header"] = None
+                    read_kwargs["names"] = [
+                        "agg_trade_id", "price", "quantity",
+                        "first_trade_id", "last_trade_id",
+                        "transact_time", "is_buyer_maker"
+                    ]
+
+                chunk_iter = pd.read_csv(f, **read_kwargs)
 
                 for chunk in chunk_iter:
                     table = pa.Table.from_pandas(chunk, schema=PARQUET_SCHEMA, preserve_index=False)
