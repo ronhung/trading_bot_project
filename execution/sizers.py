@@ -116,3 +116,67 @@ class FixedRiskSizer(BasePositionSizer):
 
         size = math.floor(size / self.min_size) * self.min_size
         return size if size >= self.min_size else 0.0
+
+
+
+class HalfKellySizer(BasePositionSizer):
+    """
+    Half-Kelly Position Sizer with Hard Leverage/Risk Caps.
+
+    Calculates trade risk percentage based on the Half-Kelly criterion:
+        f* = (p * b - q) / b
+        f_half = 0.5 * f*
+        risk_pct = min(max(0.0, f_half), max_risk_cap)
+        size = (account_equity * risk_pct) / stop_distance
+
+    Where:
+        p = win rate (or dynamic ML predicted probability)
+        b = payout ratio (average win / average loss)
+        q = 1 - p
+    """
+
+    def __init__(
+        self,
+        win_rate: float = 0.45,
+        profit_factor: float = 2.0,
+        max_risk_cap: float = 0.05,
+        max_leverage: float = 10.0,
+        min_size: float = 0.001,
+        **kwargs,
+    ):
+        self.win_rate = float(win_rate)
+        self.profit_factor = float(profit_factor)
+        self.max_risk_cap = float(max_risk_cap)
+        self.max_leverage = float(max_leverage)
+        self.min_size = float(min_size)
+
+    def calculate_size(
+        self,
+        signal_strength: float,
+        current_atr: float,
+        account_equity: float,
+        entry_price: float | None = None,
+        stop_distance: float | None = None,
+    ) -> float:
+        if account_equity <= 0.0 or stop_distance is None or stop_distance <= 0.0:
+            return 0.0
+
+        p = signal_strength if 0.0 < signal_strength < 1.0 else self.win_rate
+        b = self.profit_factor
+        q = 1.0 - p
+
+        full_kelly = (p * b - q) / b if b > 0.0 else 0.0
+        if full_kelly <= 0.0:
+            return 0.0
+
+        half_kelly = 0.5 * full_kelly
+        risk_pct = min(half_kelly, self.max_risk_cap)
+
+        size = (account_equity * risk_pct) / stop_distance
+
+        if entry_price is not None and entry_price > 0.0:
+            max_notional = account_equity * self.max_leverage
+            size = min(size, max_notional / entry_price)
+
+        size = math.floor(size / self.min_size) * self.min_size
+        return size if size >= self.min_size else 0.0

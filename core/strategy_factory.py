@@ -75,9 +75,10 @@ def _lazy_register_builtins():
     register_trigger("bollinger_mean_reversion")(BollingerMeanReversionTrigger)
 
     # Sizers
-    from execution.sizers import FixedRiskSizer, VolatilityTargetingSizer
+    from execution.sizers import FixedRiskSizer, VolatilityTargetingSizer, HalfKellySizer
     register_sizer("fixed_risk")(FixedRiskSizer)
     register_sizer("volatility_targeting")(VolatilityTargetingSizer)
+    register_sizer("half_kelly")(HalfKellySizer)
 
     # Risk Managers
     from execution.risk_managers import MaxDrawdownRiskManager, AllowAllRiskManager, LivePositionGate
@@ -206,7 +207,15 @@ def build_strategy_from_config(config_input: str | Dict[str, Any]) -> Tuple[Stra
     max_leverage = float(sizing_cfg.get("max_leverage", cfg.get("max_leverage", 20.0)))
     sizer_type = sizing_cfg.get("type", "fixed_risk").lower()
     sizer_cls = SIZER_REGISTRY.get(sizer_type, SIZER_REGISTRY["fixed_risk"])
-    sizer = sizer_cls(risk_pct=risk_pct, max_leverage=max_leverage)
+    if sizer_type == "half_kelly":
+        sizer = sizer_cls(
+            win_rate=float(sizing_cfg.get("win_rate", 0.45)),
+            profit_factor=float(sizing_cfg.get("profit_factor", 2.0)),
+            max_risk_cap=float(sizing_cfg.get("max_risk_cap", 0.05)),
+            max_leverage=max_leverage,
+        )
+    else:
+        sizer = sizer_cls(risk_pct=risk_pct, max_leverage=max_leverage)
 
     risk_cfg = cfg.get("risk", {})
     max_dd_pct = float(risk_cfg.get("max_dd_pct", cfg.get("max_dd_pct", 0.15)))

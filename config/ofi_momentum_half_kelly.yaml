@@ -1,0 +1,79 @@
+# ================================================================
+# Microstructure OFI Momentum Strategy — Half-Kelly Sizing Test
+# ================================================================
+# Trigger: OFIMomentumTrigger (Order Flow Imbalance + Donchian breakout)
+# Microstructure Data: 3-Year Binance USD-M Futures aggTrades (2021-2023)
+# Sizing: Half-Kelly (win_rate=0.48, profit_factor=2.2, max_risk_cap=3.5%, max_leverage=8.0)
+# Risk Manager: MaxDrawdownRiskManager (max_dd 20%)
+# Bracket Exit: 90-bar trailing stop (Donchian Low)
+# ================================================================
+
+strategy:
+  name: "ofi_momentum_half_kelly"
+  version: "1.0"
+  symbol: "BTCUSDT"
+
+data:
+  source: "data/historical_data/BTCUSDT_1m_microstructure_3yr.parquet"
+  train_range: ["2021-01-01", "2023-01-01"]
+  test_range:  ["2023-01-01", "2023-12-31"]
+
+trigger:
+  type: "research.triggers.ofi_momentum.OFIMomentumTrigger"
+  params:
+    entry_period: 2160     # 1.5-day breakout
+    ofi_window: 240        # 4-hour rolling OFI
+    ofi_threshold: 0.03    # Order flow buying confirmation
+    trend_period: 8640     # 6-day macro trend filter
+    long_only: true
+
+indicators:
+  entry_period: 2160
+  exit_period: 1080        # 0.75-day trailing exit
+  atr_period: 2160
+  vol_period: 1440
+  ma_period: 8640
+
+features:
+  - type: "research.features.ATRFeature"
+  - type: "research.features.BreakoutIntensityFeature"
+  - type: "research.features.VolumeRatioFeature"
+  - type: "research.features.ChannelPositionFeature"
+  - type: "research.features.DonchianWidthFeature"
+  - type: "research.features.LaggedReturnsFeature"
+  - type: "research.features.TakerFlowFeature"
+  - type: "research.features.TrendFilterFeature"
+
+labeler:
+  type: "research.labeling.TrailingExitLabeler"
+  params:
+    trail_period: 1080
+
+model:
+  type: "xgboost_classifier"
+  target: "r_multiple"
+  output_prefix: "ofi_momentum"
+  threshold: 0.52
+
+sizing:
+  type: "half_kelly"
+  win_rate: 0.48
+  profit_factor: 2.2
+  max_risk_cap: 0.035
+  max_leverage: 8.0
+
+risk:
+  type: "max_drawdown"
+  max_dd_pct: 0.20
+
+execution:
+  entry:
+    order_type: market
+    time_in_force: gtc
+    timeout_ms: 0
+    unfilled_policy: cancel
+  exit:
+    order_type: market
+    time_in_force: gtc
+    timeout_ms: 3000
+    unfilled_policy: market
