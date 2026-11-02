@@ -40,10 +40,42 @@ def _report(name, r):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--config", type=str, default=None, help="Path to strategy YAML config")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--bollinger", action="store_true")
     ap.add_argument("--trend", action="store_true")
     args = ap.parse_args()
+
+    if args.config:
+        import yaml
+        from core.strategy_factory import build_strategy_from_config
+        with open(args.config, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        
+        data_source = cfg.get("data", {}).get("source", "data/historical_data/BTCUSDT_1m_full.parquet")
+        if not os.path.isabs(data_source):
+            data_source = os.path.join(_PROJECT_ROOT, data_source)
+        
+        df = pd.read_parquet(data_source)
+        df["datetime"] = pd.to_datetime(df.get("datetime", pd.to_datetime(df.get("open_time", 0), unit="ms")))
+        
+        train_range = cfg.get("data", {}).get("train_range", None)
+        if train_range and len(train_range) == 2:
+            df = df[(df["datetime"] >= train_range[0]) & (df["datetime"] < train_range[1])].reset_index(drop=True)
+            print(f"Loaded config data: {len(df):,} bars ({train_range[0]} to {train_range[1]})")
+        else:
+            print(f"Loaded config data: {len(df):,} bars")
+
+        wrapper, meta = build_strategy_from_config(cfg)
+        trig = wrapper._trigger
+        name = cfg.get("strategy", {}).get("name", trig.__class__.__name__)
+        
+        entry_p = meta["indicator_params"].get("entry_period", 180)
+        horizons = (entry_p // 2, entry_p, entry_p * 2, entry_p * 4)
+        r = analyze_trigger(trig, df, mode="fixed_horizon", horizons=horizons, seed=0)
+        _report(f"{name} ({trig.__class__.__name__})", r)
+        return
+
     if not (args.all or args.bollinger or args.trend):
         args.all = True
 

@@ -152,17 +152,19 @@ def build_strategy_from_config(config_input: str | Dict[str, Any]) -> Tuple[Stra
     trigger = trigger_cls(**trigger_params)
 
     # 3. Features & Indicators
-    from research.features import default_feature_set
+    from research.features import default_feature_set, CompositeFeature
     feature_list_cfg = cfg.get("features", [])
-    features: List[BaseFeature] = []
+    features_list: List[BaseFeature] = []
     if isinstance(feature_list_cfg, list) and len(feature_list_cfg) > 0 and isinstance(feature_list_cfg[0], dict):
         for f_item in feature_list_cfg:
             f_type = f_item.get("type")
             f_params = f_item.get("params", {})
             if f_type:
                 f_cls = _resolve_class(f_type, {})
-                features.append(f_cls(**f_params))
-    if not features:
+                features_list.append(f_cls(**f_params))
+    if features_list:
+        features = CompositeFeature(features_list)
+    else:
         features = default_feature_set()
 
     # 4. Exit / Bracket configuration & Indicator params

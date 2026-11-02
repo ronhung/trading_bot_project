@@ -30,13 +30,76 @@ def load():
     return train, test
 
 
-def bt(df, name, trigger, labeler, indicator_params, risk_pct=0.01):
+import argparse
+import yaml
+import importlib
+from core.strategy_factory import build_strategy_from_config
+from core.labeler import BaseLabeler
+
+
+def _resolve_labeler(labeler_cfg: dict) -> BaseLabeler:
+    l_type = labeler_cfg.get("type", "research.labeling.TrailingExitLabeler")
+    l_params = labeler_cfg.get("params", {})
+    if "." in l_type:
+        mod_name, cls_name = l_type.rsplit(".", 1)
+        mod = importlib.import_module(mod_name)
+        cls = getattr(mod, cls_name)
+    elif "trail" in l_type.lower():
+        cls = TrailingExitLabeler
+    else:
+        cls = MeanReversionLabeler
+    return cls(**l_params)
+
+
+def run_from_config(config_path: str):
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    data_source = cfg.get("data", {}).get("source", "data/historical_data/BTCUSDT_1m_full.parquet")
+    if not os.path.isabs(data_source):
+        data_source = os.path.join(_PROJECT_ROOT, data_source)
+
+    df = pd.read_parquet(data_source)
+    df["datetime"] = pd.to_datetime(df.get("datetime", pd.to_datetime(df.get("open_time", 0), unit="ms")))
+
+    wrapper, meta = build_strategy_from_config(cfg)
+    trigger = wrapper._trigger
+    sizer = wrapper._sizer
+    risk_mgr = wrapper._risk_manager
+    ind_params = meta["indicator_params"]
+
+    labeler_cfg = cfg.get("labeler", {"type": "research.labeling.TrailingExitLabeler", "params": {"trail_period": ind_params["exit_period"]}})
+    labeler = _resolve_labeler(labeler_cfg)
+
+    train_range = cfg.get("data", {}).get("train_range", None)
+    test_range = cfg.get("data", {}).get("test_range", None)
+
+    name = cfg.get("strategy", {}).get("name", "Strategy")
+    print(f"\n=======================================================")
+    print(f"Phase 3b Backtest: {name} (Config-Driven Vectorized)")
+    print(f"=======================================================")
+
+    if train_range and len(train_range) == 2:
+        train_df = df[(df["datetime"] >= train_range[0]) & (df["datetime"] < train_range[1])].reset_index(drop=True)
+        print(f"\n--- TRAIN SET ({train_range[0]} to {train_range[1]}) : {len(train_df):,} bars ---")
+        bt(train_df, f"{name} [TRAIN]", trigger, labeler, ind_params, sizer=sizer, risk_mgr=risk_mgr)
+
+    if test_range and len(test_range) == 2:
+        test_df = df[(df["datetime"] >= test_range[0]) & (df["datetime"] <= test_range[1])].reset_index(drop=True)
+        print(f"\n--- TEST SET ({test_range[0]} to {test_range[1]}) : {len(test_df):,} bars ---")
+        bt(test_df, f"{name} [TEST]", trigger, labeler, ind_params, sizer=sizer, risk_mgr=risk_mgr)
+
+    print(f"\n--- FULL 3-YEAR DATASET ({df['datetime'].iloc[0]} to {df['datetime'].iloc[-1]}) : {len(df):,} bars ---")
+    bt(df, f"{name} [FULL 3-YEAR]", trigger, labeler, ind_params, sizer=sizer, risk_mgr=risk_mgr)
+
+
+def bt(df, name, trigger, labeler, indicator_params, sizer=None, risk_mgr=None, risk_pct=0.01):
     result = lightweight_backtest(
         df,
         trigger=trigger,
         exit_labeler=labeler,
-        position_sizer=FixedRiskSizer(risk_pct=risk_pct, max_leverage=20.0),
-        risk_manager=MaxDrawdownRiskManager(max_dd_pct=0.30),
+        position_sizer=sizer or FixedRiskSizer(risk_pct=risk_pct, max_leverage=20.0),
+        risk_manager=risk_mgr or MaxDrawdownRiskManager(max_dd_pct=0.30),
         indicator_params=indicator_params,
         initial_capital=100000.0,
     )
@@ -46,6 +109,14 @@ def bt(df, name, trigger, labeler, indicator_params, risk_pct=0.01):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", type=str, default=None, help="Path to strategy YAML config")
+    args = ap.parse_args()
+
+    if args.config:
+        run_from_config(args.config)
+        return
+
     train, test = load()
     print(f"train {len(train):,} bars | test {len(test):,} bars\n")
 

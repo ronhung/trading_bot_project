@@ -20,4 +20,5 @@ CMakeFiles/
 *.dll
 *.lib
 data/historical_data/aggtrades/
+data/historical_data/microstructure_1m/
 
